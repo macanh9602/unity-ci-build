@@ -1,0 +1,405 @@
+﻿# ============================================================
+#  Common.ps1 - helper dung chung cho toan bo tool
+# ============================================================
+$ErrorActionPreference = 'Stop'
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
+$script:LibDir  = $PSScriptRoot
+$script:ToolDir = Split-Path -Parent $PSScriptRoot
+
+function Get-ToolDir    { $script:ToolDir }
+function Get-ConfigPath { Join-Path $script:ToolDir 'config.json' }
+function Get-SecretsPath{ Join-Path $script:ToolDir 'secrets.json' }
+
+# ---------- console ----------
+function Set-ConsoleUtf8 {
+    try {
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        $global:OutputEncoding    = [System.Text.Encoding]::UTF8
+    } catch {}
+}
+
+function Write-Title([string]$Text) {
+    Write-Host ''
+    Write-Host ('  ' + $Text.ToUpper()) -ForegroundColor Cyan
+    Write-Host ('  ' + ('-' * 58)) -ForegroundColor DarkCyan
+}
+function Write-Ok   ([string]$m) { Write-Host '  [OK]    ' -ForegroundColor Green   -NoNewline; Write-Host $m }
+function Write-Miss ([string]$m) { Write-Host '  [THIEU] ' -ForegroundColor Yellow  -NoNewline; Write-Host $m }
+function Write-Bad  ([string]$m) { Write-Host '  [LOI]   ' -ForegroundColor Red     -NoNewline; Write-Host $m }
+function Write-Info ([string]$m) { Write-Host '  ' -NoNewline; Write-Host $m -ForegroundColor Gray }
+function Write-Hint ([string]$m) { Write-Host '          -> ' -ForegroundColor DarkGray -NoNewline; Write-Host $m -ForegroundColor DarkGray }
+
+function Read-Choice {
+    param([string]$Prompt, [string]$Default = '')
+    if ($Default) { $p = "  $Prompt [$Default]: " } else { $p = "  $Prompt : " }
+    Write-Host $p -ForegroundColor White -NoNewline
+    $v = Read-Host
+    if ([string]::IsNullOrWhiteSpace($v)) { return $Default }
+    return $v.Trim()
+}
+
+function Read-YesNo {
+    param([string]$Prompt, [bool]$Default = $true)
+    $d = if ($Default) { 'Y/n' } else { 'y/N' }
+    while ($true) {
+        Write-Host "  $Prompt [$d]: " -ForegroundColor White -NoNewline
+        $v = (Read-Host).Trim().ToLower()
+        if ($v -eq '') { return $Default }
+        if ($v -in @('y','yes','c','co')) { return $true }
+        if ($v -in @('n','no','k','khong')) { return $false }
+    }
+}
+
+# ---------- file io ----------
+function Set-Utf8NoBom {
+    param([string]$Path, [string]$Text)
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Text, $enc)
+}
+
+function Read-JsonFile([string]$Path) {
+    if (-not (Test-Path $Path)) { return $null }
+    $raw = [System.IO.File]::ReadAllText($Path)
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+    return ($raw | ConvertFrom-Json)
+}
+
+function Write-JsonFile([string]$Path, $Object) {
+    Set-Utf8NoBom -Path $Path -Text ($Object | ConvertTo-Json -Depth 10)
+}
+
+# ---------- config (v2: nhieu project) ----------
+#  config.json v2:
+#    { version, ciRoot, reserveCoresForEditor, buildTimeoutMinutes, useNographics,
+#      discord:{enabled}, defaultProject, projects:[ {name, projectPath, unityExe,
+#      unityVersion, worktreePath, buildsPath, drive:{}, android:{}} ] }
+#
+#  Cai dat CHUNG (o dia, so core, timeout, Discord) dung chung moi project.
+#  Rieng tung project: duong dan, Unity, noi do file, keystore.
+
+function ConvertTo-CiConfigV2 {
+    param($Cfg)
+    if (-not $Cfg) { return $null }
+    if ($Cfg.PSObject.Properties.Name -contains 'projects') { return $Cfg }
+
+    # config v1 - goi ca cau hinh cu vao lam project dau tien, khong mat gi
+    [pscustomobject]@{
+        version               = 2
+        ciRoot                = $Cfg.ciRoot
+        reserveCoresForEditor = $Cfg.reserveCoresForEditor
+        buildTimeoutMinutes   = $Cfg.buildTimeoutMinutes
+        useNographics         = $Cfg.useNographics
+        discord               = $Cfg.discord
+        defaultProject        = $Cfg.projectName
+        projects              = @(
+            [pscustomobject]@{
+                name         = $Cfg.projectName
+                projectPath  = $Cfg.projectPath
+                unityExe     = $Cfg.unityExe
+                unityVersion = $Cfg.unityVersion
+                worktreePath = $Cfg.worktreePath
+                buildsPath   = $Cfg.buildsPath
+                drive        = $Cfg.drive
+                android      = $Cfg.android
+            }
+        )
+    }
+}
+
+function Read-CiConfig {
+    $p = Get-ConfigPath
+    $c = Read-JsonFile $p
+    if (-not $c) { throw "Chua cai dat. Chay install.bat truoc." }
+
+    $needMigrate = -not ($c.PSObject.Properties.Name -contains 'projects')
+    $c = ConvertTo-CiConfigV2 $c
+    if ($needMigrate) { try { Write-JsonFile $p $c } catch {} }   # ghi lai mot lan
+    return $c
+}
+
+function Write-CiConfig { param($Cfg) Write-JsonFile (Get-ConfigPath) $Cfg }
+
+function Test-CiInstalled { Test-Path (Get-ConfigPath) }
+
+function Get-CiProjectNames { param($Cfg) @($Cfg.projects | ForEach-Object { $_.name }) }
+
+function Get-CiProject {
+    param($Cfg, [string]$Name = '')
+    if (-not $Cfg.projects -or @($Cfg.projects).Count -eq 0) { return $null }
+    if (-not $Name) { $Name = "$($Cfg.defaultProject)" }
+    $p = $Cfg.projects | Where-Object { $_.name -eq $Name } | Select-Object -First 1
+    if (-not $p) { $p = @($Cfg.projects)[0] }
+    return $p
+}
+
+# Tim project theo duong dan thu muc (cho Unity Editor tu nhan dung project)
+function Find-CiProjectByPath {
+    param($Cfg, [string]$Path)
+    if (-not $Path) { return $null }
+    $norm = $Path.TrimEnd('\','/').ToLower()
+    $Cfg.projects | Where-Object { "$($_.projectPath)".TrimEnd('\','/').ToLower() -eq $norm } | Select-Object -First 1
+}
+
+# Gop cai dat chung + cai dat cua mot project thanh mot object phang,
+# dung y het hinh dang config v1 -> runner va Drive.ps1 khong phai sua gi.
+function Get-EffectiveConfig {
+    param($Cfg, [string]$ProjectName = '')
+    $p = Get-CiProject $Cfg $ProjectName
+    if (-not $p) { throw "Chua co project nao trong config. Chay install.bat." }
+    [pscustomobject]@{
+        version               = 2
+        projectName           = $p.name
+        projectPath           = $p.projectPath
+        unityExe              = $p.unityExe
+        unityVersion          = $p.unityVersion
+        worktreePath          = $p.worktreePath
+        buildsPath            = $p.buildsPath
+        drive                 = $p.drive
+        android               = $p.android
+        ciRoot                = $Cfg.ciRoot
+        reserveCoresForEditor = $Cfg.reserveCoresForEditor
+        buildTimeoutMinutes   = $Cfg.buildTimeoutMinutes
+        useNographics         = $Cfg.useNographics
+        discord               = $Cfg.discord
+    }
+}
+
+# ---------- secrets (DPAPI - chi giai ma duoc boi chinh user nay tren chinh may nay) ----------
+function Protect-CiString([string]$Plain) {
+    if ([string]::IsNullOrEmpty($Plain)) { return '' }
+    return (ConvertTo-SecureString $Plain -AsPlainText -Force | ConvertFrom-SecureString)
+}
+
+function Unprotect-CiString([string]$Cipher) {
+    if ([string]::IsNullOrEmpty($Cipher)) { return '' }
+    try {
+        $ss = ConvertTo-SecureString $Cipher
+        $b  = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($ss)
+        try   { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b) }
+        finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) }
+    } catch { return '' }
+}
+
+function Read-CiSecrets {
+    $s = Read-JsonFile (Get-SecretsPath)
+    if (-not $s) {
+        $s = [pscustomobject]@{ discordWebhook=''; projects=[pscustomobject]@{} }
+    }
+    return $s
+}
+
+# Keystore la cua tung project, khong dung chung -> luu long theo ten project.
+# secrets.json: { discordWebhook, projects: { <ten>: { keystorePass, keyaliasPass } } }
+function Get-ProjectSecretRaw {
+    param($Secrets, [string]$ProjectName, [string]$Name)
+    if (-not $Secrets) { return '' }
+    if ($ProjectName -and $Secrets.PSObject.Properties.Name -contains 'projects' -and $Secrets.projects) {
+        $p = $Secrets.projects.$ProjectName
+        if ($p -and $p.$Name) { return "$($p.$Name)" }
+    }
+    # secrets.json doi cu chi co mot project -> van doc duoc
+    if ($Secrets.PSObject.Properties.Name -contains $Name -and $Secrets.$Name) { return "$($Secrets.$Name)" }
+    return ''
+}
+
+function Get-ProjectSecret {
+    param($Secrets, [string]$ProjectName, [string]$Name)
+    Unprotect-CiString (Get-ProjectSecretRaw $Secrets $ProjectName $Name)
+}
+
+function Save-CiSecrets {
+    param(
+        $Secrets,
+        [string]$DiscordCipher = '',
+        [string]$ProjectName   = '',
+        [string]$KeystorePass  = '',
+        [string]$KeyaliasPass  = ''
+    )
+    $bag = @{}
+    if ($Secrets -and $Secrets.PSObject.Properties.Name -contains 'projects' -and $Secrets.projects) {
+        foreach ($prop in $Secrets.projects.PSObject.Properties) { $bag[$prop.Name] = $prop.Value }
+    }
+    if ($ProjectName) {
+        $bag[$ProjectName] = [pscustomobject]@{ keystorePass = $KeystorePass; keyaliasPass = $KeyaliasPass }
+    }
+    Write-JsonFile (Get-SecretsPath) ([pscustomobject]@{
+        discordWebhook = $DiscordCipher
+        projects       = [pscustomobject]$bag
+    })
+}
+
+function Get-Secret($secrets, [string]$Name) {
+    if (-not $secrets) { return '' }
+    $v = $secrets.$Name
+    if (-not $v) { return '' }
+    return (Unprotect-CiString $v)
+}
+
+# ---------- paths ----------
+# Noi duong dan bang chuoi thuan.
+# Join-Path cua PowerShell di qua provider -> no CO GANG resolve o dia,
+# nen nem loi voi duong dan Windows tren may khong co o do, va lam
+# code khong test duoc ngoai Windows. Duong dan o day chi la du lieu.
+function Join-CiPath {
+    param([string]$Base, [Parameter(ValueFromRemainingArguments=$true)][string[]]$Parts)
+    $b = "$Base"
+    # Giu nguyen kieu dau phan cach cua chinh duong dan goc
+    $sep = if ($b.StartsWith('/')) { '/' } else { '\' }
+    $p = $b.TrimEnd('\','/')
+    foreach ($x in $Parts) {
+        if (-not $x) { continue }
+        $p = $p + $sep + ("$x").Trim('\','/')
+    }
+    return $p
+}
+
+function Get-CiPaths($cfg) {
+    [pscustomobject]@{
+        Root       = $cfg.ciRoot
+        Queue      = Join-CiPath $cfg.ciRoot 'queue'
+        Processing = Join-CiPath $cfg.ciRoot 'processing'
+        Results    = Join-CiPath $cfg.ciRoot 'results'
+        Logs       = Join-CiPath $cfg.ciRoot 'logs'
+        Worktree   = $cfg.worktreePath
+        Builds     = $cfg.buildsPath
+        RunnerLog  = Join-CiPath $cfg.ciRoot 'runner.log'
+    }
+}
+
+function Initialize-CiDirs($cfg) {
+    $p = Get-CiPaths $cfg
+    foreach ($d in @($p.Root,$p.Queue,$p.Processing,$p.Results,$p.Logs,$p.Builds)) {
+        if ($d -and -not (Test-Path $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    }
+}
+
+function Write-RunnerLog($cfg, [string]$Message) {
+    try {
+        $p = Get-CiPaths $cfg
+        $line = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
+        Add-Content -Path $p.RunnerLog -Value $line -Encoding UTF8
+    } catch {}
+}
+
+# ---------- git ----------
+function Invoke-Git {
+    param([string]$RepoPath, [string[]]$GitArgs)
+    # git ghi thong tin ra stderr ca khi thanh cong -> phai ha ErrorAction,
+    # neu khong PowerShell se nem NativeCommandError va giet ca runner.
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $all = @('-C', $RepoPath) + $GitArgs
+        $out = & git @all 2>&1
+        return [pscustomobject]@{
+            ExitCode = $LASTEXITCODE
+            Output   = (($out | ForEach-Object { "$_" }) -join "`n")
+        }
+    } finally { $ErrorActionPreference = $old }
+}
+
+function ConvertTo-IntSafe {
+    param($Value, [int]$Default = 0)
+    $n = 0
+    if ([int]::TryParse(("$Value").Trim(), [ref]$n)) { return $n }
+    return $Default
+}
+
+function Get-GitInfo([string]$RepoPath) {
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+    $sha     = (& git -C $RepoPath rev-parse HEAD 2>$null)
+    if ($LASTEXITCODE -ne 0 -or -not $sha) { return $null }
+    $branch  = (& git -C $RepoPath rev-parse --abbrev-ref HEAD 2>$null)
+    $subject = (& git -C $RepoPath log -1 --pretty=%s 2>$null)
+    $dirty   = (& git -C $RepoPath status --porcelain 2>$null)
+    $count   = (& git -C $RepoPath rev-list --count HEAD 2>$null)
+    [pscustomobject]@{
+        Sha        = "$sha".Trim()
+        ShaShort   = "$sha".Trim().Substring(0, 7)
+        Branch     = "$branch".Trim()
+        Subject    = "$subject".Trim()
+        IsDirty    = -not [string]::IsNullOrWhiteSpace(($dirty -join ''))
+        DirtyCount = @($dirty).Where({ $_ }).Count
+        CommitCount= (ConvertTo-IntSafe $count 0)
+    }
+    } finally { $ErrorActionPreference = $old }
+}
+
+# Chuan hoa duong dan goc cua CI.
+# Bay da dinh: go 'E' hoac 'E:' deu KHONG phai duong dan tuyet doi.
+#   'E'   -> duong dan tuong doi, folder ten E nam canh script
+#   'E:'  -> "thu muc hien hanh cua o E", khong phai goc o E
+# Ca hai deu tao ra worktree sai cho ma khong bao loi gi.
+#
+# Luat duong dan Windows viet thang bang regex chu khong goi [System.IO.Path],
+# vi cac API do doi hanh vi theo he dieu hanh -> khong test duoc ngoai Windows.
+function Test-CiRootValid {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    if ($Path -match '^[A-Za-z]:\\') { return $true }          # E:\...
+    if ($Path -match '^\\\\[^\\]+\\[^\\]+') { return $true }    # \\server\share\...
+    return $false
+}
+
+function Resolve-CiRootPath {
+    param([string]$InputPath, [string]$LeafName = 'UnityCI')
+    $p = ("$InputPath").Trim().Trim('"').Trim("'")
+    if (-not $p) { return '' }
+
+    # Chi go chu cai o dia: E / e / E: / E:\  -> <X>:\<LeafName>
+    if ($p -match '^([A-Za-z]):?\\?$') {
+        return ($Matches[1].ToUpper() + ':\' + $LeafName)
+    }
+    # Go 'E:something' (thieu gach cheo) -> 'E:\something'
+    if ($p -match '^([A-Za-z]):([^\\/].*)$') {
+        $p = $Matches[1].ToUpper() + ':\' + $Matches[2]
+    }
+    $p = $p -replace '/', '\'
+    if (-not (Test-CiRootValid $p)) { return '' }
+    return $p.TrimEnd('\')
+}
+
+# Uoc tinh thoi gian build tu cac lan THANH CONG truoc do cua dung
+# project + dung loai build. Dung trung vi de mot lan bat thuong
+# (may ban, build lan dau import lai tu dau) khong keo lech.
+function Get-CiEtaSeconds {
+    param($Config, [string]$ProjectName, [string]$Format, [string]$BuildConfig, [int]$Samples = 5)
+    try {
+        $paths = Get-CiPaths $Config
+        if (-not (Test-Path $paths.Results)) { return 0 }
+        $files = @(Get-ChildItem -Path $paths.Results -Filter '*.json' -ErrorAction SilentlyContinue |
+                   Sort-Object Name -Descending | Select-Object -First 50)
+        $vals = New-Object System.Collections.ArrayList
+        foreach ($f in $files) {
+            $r = Read-JsonFile $f.FullName
+            if (-not $r -or -not $r.success) { continue }
+            if ("$($r.project)" -ne $ProjectName) { continue }
+            if ("$($r.format)"  -ne $Format)      { continue }
+            if ("$($r.config)"  -ne $BuildConfig) { continue }
+            [void]$vals.Add([double]$r.durationSec)
+            if ($vals.Count -ge $Samples) { break }
+        }
+        if ($vals.Count -eq 0) { return 0 }
+        $sorted = @($vals | Sort-Object)
+        return [double]$sorted[[int][Math]::Floor($sorted.Count / 2)]
+    } catch { return 0 }
+}
+
+function Format-Bytes([long]$Bytes) {
+    if ($Bytes -ge 1GB) { return ('{0:N1} GB' -f ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return ('{0:N1} MB' -f ($Bytes / 1MB)) }
+    if ($Bytes -ge 1KB) { return ('{0:N0} KB' -f ($Bytes / 1KB)) }
+    return "$Bytes B"
+}
+
+function Format-Duration([double]$Seconds) {
+    $ts = [TimeSpan]::FromSeconds($Seconds)
+    if ($ts.TotalHours -ge 1) { return ('{0}h {1}m' -f [int]$ts.TotalHours, $ts.Minutes) }
+    if ($ts.TotalMinutes -ge 1) { return ('{0}m {1}s' -f [int]$ts.TotalMinutes, $ts.Seconds) }
+    return ('{0}s' -f [int]$ts.TotalSeconds)
+}

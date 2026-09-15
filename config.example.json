@@ -1,0 +1,51 @@
+{
+    "_doc": "Copy thanh config.json roi sua, HOAC chi can chay install.bat - no tu sinh ra file nay.",
+    "version": 2,
+
+    "ciRoot": "E:\\UnityCI",
+    "_ciRoot": "BAT BUOC duong dan tuyet doi co o dia. Go 'E' hoac 'E:' la SAI.",
+
+    "reserveCoresForEditor": 4,
+    "buildTimeoutMinutes": 90,
+    "useNographics": false,
+
+    "discord": { "enabled": true },
+    "_discord": "URL webhook nam trong secrets.json, khong nam o day.",
+
+    "defaultProject": "ten-project",
+    "projects": [
+        {
+            "name": "ten-project",
+            "projectPath": "D:\\Projects\\TenProject",
+            "unityExe": "C:\\Program Files\\Unity\\Hub\\Editor\\6000.0.70f1\\Editor\\Unity.exe",
+            "unityVersion": "6000.0.70f1",
+            "worktreePath": "E:\\UnityCI\\worktree\\ten-project",
+            "buildsPath": "E:\\UnityCI\\builds\\ten-project",
+
+            "drive": {
+                "mode": "none",
+                "_mode": "none | folder | rclone",
+
+                "folderPath": "",
+                "_folderPath": "che do folder: noi copy file den, vd G:\\My Drive\\Builds",
+                "shareUrl": "",
+                "_shareUrl": "che do folder: link Discord se kem theo (tuy chon)",
+
+                "rclonePath": "",
+                "remote": "",
+                "_remote": "che do rclone: ten remote, vd gdrive:",
+                "folder": "",
+                "_folder": "che do rclone: thu muc con, vd Builds/TenProject",
+                "rootFolderId": "",
+                "_rootFolderId": "che do rclone: ID folder Drive lay tu link (tuy chon)",
+                "makeLink": true
+            },
+
+            "android": {
+                "keystorePath": "",
+                "keyaliasName": "",
+                "_note": "Mat khau nam trong secrets.json, khong nam o day."
+            }
+        }
+    ]
+}

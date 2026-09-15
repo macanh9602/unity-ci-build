@@ -1,0 +1,32 @@
+# ============================================================
+#  KHONG day len git - rieng cua tung may
+# ============================================================
+
+# Duong dan may, ten Windows user, folder ID cua Drive
+config.json
+
+# Webhook Discord + mat khau keystore (da ma hoa DPAPI, van khong day len)
+secrets.json
+
+# ============================================================
+#  Thu muc lam viec - phinh to va khong co y nghia voi nguoi khac
+# ============================================================
+queue/
+processing/
+results/
+logs/
+builds/
+worktree/
+runner.log
+*.errors.txt
+*.unity-result.json
+
+# Neu lo tro ciRoot vao chinh thu muc tool (duong dan sai thieu o dia)
+[A-Z]/
+
+# ============================================================
+#  Rac he thong
+# ============================================================
+Thumbs.db
+desktop.ini
+.DS_Store
