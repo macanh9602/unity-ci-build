@@ -18,7 +18,10 @@ function Add-CiJob {
         [ValidateSet('dev','release')][string]$BuildConfig = 'dev',
         [string]$By = 'cli',
         [int]$VersionCode = 0,
-        [string]$Project = ''
+        [string]$Project = '',
+        [string]$Platform = 'android',
+        [string]$GitRemote = '',
+        [string]$UnityVersion = ''
     )
     $paths = Get-CiPaths $Config
     if (-not (Test-Path $paths.Queue)) { New-Item -ItemType Directory -Force -Path $paths.Queue | Out-Null }
@@ -27,6 +30,9 @@ function Add-CiJob {
     $job = [ordered]@{
         id          = $id
         project     = $Project
+        platform    = $Platform
+        gitRemote   = $GitRemote
+        unityVersion= $UnityVersion
         sha         = $Sha
         shaShort    = $Sha.Substring(0,7)
         branch      = $Branch
@@ -55,12 +61,37 @@ function Get-CiQueue($Config) {
         ForEach-Object { $j = Read-JsonFile $_.FullName; if ($j) { $j | Add-Member -NotePropertyName _file -NotePropertyValue $_.FullName -Force; $j } }
 }
 
-function Move-CiJobToProcessing($Config, $Job) {
+# Gianh job bang cach DOI TEN file sang thu muc rieng cua agent.
+# Rename la thao tac nguyen tu ca tren o mang, nen hai agent cung nhay vao
+# mot job thi mot cai that bai -> tra ve $null va bo qua job do.
+# Khoa mutex khong dung duoc o day vi no chi co tac dung trong mot may.
+function Move-CiJobToProcessing {
+    param($Config, $Job, [string]$AgentName = '')
     $paths = Get-CiPaths $Config
-    if (-not (Test-Path $paths.Processing)) { New-Item -ItemType Directory -Force -Path $paths.Processing | Out-Null }
-    $dest = Join-CiPath $paths.Processing ("{0}.json" -f $Job.id)
-    Move-Item -LiteralPath $Job._file -Destination $dest -Force
-    return $dest
+    $dir = if ($AgentName) { Join-CiPath $paths.Processing $AgentName } else { $paths.Processing }
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    $dest = Join-CiPath $dir ("{0}.json" -f $Job.id)
+    try {
+        if (-not (Test-Path $Job._file)) { return $null }   # agent khac vua lay mat
+        Move-Item -LiteralPath $Job._file -Destination $dest -ErrorAction Stop
+        return $dest
+    } catch {
+        return $null
+    }
+}
+
+# Agent chi nhat job ma no build duoc (Windows khong build duoc iOS).
+# Job khong ghi platform la job doi cu -> coi nhu android.
+function Select-CiJobForAgent {
+    param($Config, $Queue)
+    $can = @($Config.canBuild)
+    if ($can.Count -eq 0) { $can = @('android') }
+    foreach ($j in $Queue) {
+        $plat = "$($j.platform)"
+        if (-not $plat) { $plat = 'android' }
+        if ($can -contains $plat) { return $j }
+    }
+    return $null
 }
 
 function Clear-CiQueue($Config) {

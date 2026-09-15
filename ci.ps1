@@ -62,18 +62,50 @@ switch ($Command) {
         }
     }
 
+    # May build clone code tu remote -> commit chua push la no khong the thay.
+    # Kiem tra ngay tai day, dung de build chay roi moi chet vi ly do nay.
+    $remoteUrl = Get-GitRemoteUrl $proj.projectPath
+    if (-not (Test-CiIsAgent $root)) {
+        if (-not $remoteUrl) {
+            Write-Bad 'Repo nay chua co remote git.'
+            Write-Hint 'May build lay code tu remote. Them remote roi push truoc: git remote add origin <url>'
+            exit 1
+        }
+        Write-Info 'Dang kiem tra commit da push chua...'
+        if (-not (Test-CiShaOnRemote -RepoPath $proj.projectPath -Sha $git.Sha)) {
+            Write-Host ''
+            Write-Bad "Commit $($git.ShaShort) chua co tren remote."
+            Write-Hint 'May build clone tu remote nen se khong thay commit nay.'
+            Write-Hint "Chay:  git push"
+            exit 1
+        }
+        Write-Ok 'Commit da co tren remote'
+    }
+
     $job = Add-CiJob -Config $root -Sha $git.Sha -Branch $git.Branch -Subject $git.Subject `
                      -Format $Format -BuildConfig $Config -By 'cli' -VersionCode $git.CommitCount `
-                     -Project $proj.name
+                     -Project $proj.name -Platform 'android' `
+                     -GitRemote $remoteUrl -UnityVersion "$($proj.unityVersion)"
 
     Write-Host ''
     Write-Ok "Da xep hang: $($job.id)  [$($proj.name)]"
 
-    if (Test-CiRunnerBusy) {
-        Write-Info 'Dang co build khac chay - job nay se tu chay tiep sau.'
+    if (Test-CiIsAgent $root) {
+        if (Test-CiRunnerBusy) {
+            Write-Info 'Dang co build khac chay - job nay se tu chay tiep sau.'
+        } else {
+            Start-CiRunner
+            Write-Info 'Runner da khoi dong chay nen. Ban cu lam viec tiep binh thuong.'
+        }
     } else {
-        Start-CiRunner
-        Write-Info 'Runner da khoi dong chay nen. Ban cu lam viec tiep binh thuong.'
+        $agents = @(Get-CiAgents $root) | Where-Object { $_.Alive -and (@($_.canBuild) -contains 'android') }
+        if ($agents.Count -gt 0) {
+            Write-Info ("Da gui sang may build: {0}" -f (($agents | ForEach-Object { $_.name }) -join ', '))
+        } else {
+            Write-Miss 'Khong thay may build nao dang chay.'
+            Write-Hint 'Job van nam trong queue, agent bat len la chay tiep.'
+            Write-Hint 'Tren may build: bat agent.bat hoac kiem tra Scheduled Task.'
+        }
     }
     Write-Info "Theo doi: .\ci.ps1 status"
 }
@@ -96,8 +128,29 @@ switch ($Command) {
 'status' {
     Write-Title 'Trang thai'
 
-    if (Test-CiRunnerBusy) { Write-Host '  ' -NoNewline; Write-Host 'DANG BUILD' -ForegroundColor Yellow }
-    else                   { Write-Host '  ' -NoNewline; Write-Host 'RANH' -ForegroundColor Green }
+    Write-Info "Vai tro may nay: $($root.role)"
+
+    $agents = @(Get-CiAgents $root)
+    if ($agents.Count -gt 0) {
+        Write-Host ''
+        Write-Host '  MAY BUILD' -ForegroundColor Cyan
+        foreach ($a in $agents) {
+            if ($a.Alive) {
+                $txt = if ($a.state -eq 'building') { "dang build $($a.jobId)" } else { 'ranh' }
+                Write-Ok ("{0,-16} {1}" -f $a.name, $txt)
+            } else {
+                Write-Miss ("{0,-16} khong thay phan hoi {1} truoc" -f $a.name, (Format-Duration $a.AgeSeconds))
+            }
+        }
+        Write-Host ''
+    } elseif (-not (Test-CiIsAgent $root)) {
+        Write-Miss 'Chua thay may build nao bao danh.'
+    }
+
+    if (Test-CiIsAgent $root) {
+        if (Test-CiRunnerBusy) { Write-Host '  May nay: ' -NoNewline; Write-Host 'DANG BUILD' -ForegroundColor Yellow }
+        else                   { Write-Host '  May nay: ' -NoNewline; Write-Host 'RANH' -ForegroundColor Green }
+    }
 
     $q = @(Get-CiQueue $root)
     Write-Info "Dang xep hang: $($q.Count) job"

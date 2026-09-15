@@ -9,6 +9,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib\Queue.ps1')
 . (Join-Path $PSScriptRoot 'lib\Discord.ps1')
 . (Join-Path $PSScriptRoot 'lib\Drive.ps1')
+. (Join-Path $PSScriptRoot 'lib\Unity.ps1')
 Set-ConsoleUtf8
 
 $REQUIRED_GB = 60
@@ -45,62 +46,6 @@ function Install-WithWinget {
     $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
                 [Environment]::GetEnvironmentVariable('Path','User')
     return $true
-}
-
-function Find-UnityHub {
-    foreach ($p in @(
-        (Join-Path $env:ProgramFiles 'Unity Hub\Unity Hub.exe'),
-        (Join-Path ${env:ProgramFiles(x86)} 'Unity Hub\Unity Hub.exe')
-    )) { if ($p -and (Test-Path $p)) { return $p } }
-    return $null
-}
-
-function Get-UnityEditors {
-    $roots = New-Object System.Collections.ArrayList
-    [void]$roots.Add((Join-Path $env:ProgramFiles 'Unity\Hub\Editor'))
-    $sec = Join-Path $env:APPDATA 'UnityHub\secondaryInstallPath.json'
-    if (Test-Path $sec) {
-        $p = (Get-Content $sec -Raw -ErrorAction SilentlyContinue)
-        if ($p) { $p = $p.Trim().Trim('"'); if ($p) { [void]$roots.Add($p) } }
-    }
-    $found = New-Object System.Collections.ArrayList
-    foreach ($r in $roots) {
-        if (-not (Test-Path $r)) { continue }
-        foreach ($d in (Get-ChildItem -Path $r -Directory -ErrorAction SilentlyContinue)) {
-            $exe = Join-Path $d.FullName 'Editor\Unity.exe'
-            if (Test-Path $exe) {
-                [void]$found.Add([pscustomobject]@{
-                    Version = $d.Name
-                    Exe     = $exe
-                    Root    = $d.FullName
-                })
-            }
-        }
-    }
-    return $found.ToArray()
-}
-
-function Get-AndroidModuleState([string]$EditorRoot) {
-    $ap = Join-Path $EditorRoot 'Editor\Data\PlaybackEngines\AndroidPlayer'
-    [pscustomobject]@{
-        Installed = Test-Path $ap
-        Jdk       = Test-Path (Join-Path $ap 'OpenJDK')
-        Sdk       = Test-Path (Join-Path $ap 'SDK')
-        Ndk       = Test-Path (Join-Path $ap 'NDK')
-    }
-}
-
-function Get-ProjectUnityVersion([string]$ProjectPath) {
-    $f = Join-Path $ProjectPath 'ProjectSettings\ProjectVersion.txt'
-    if (-not (Test-Path $f)) { return $null }
-    $t = Get-Content $f -Raw
-    if ($t -match 'm_EditorVersion:\s*(\S+)') { return $Matches[1] }
-    return $null
-}
-
-function Test-UnityProject([string]$P) {
-    if (-not $P -or -not (Test-Path $P)) { return $false }
-    (Test-Path (Join-Path $P 'Assets')) -and (Test-Path (Join-Path $P 'ProjectSettings'))
 }
 
 function Get-DiskTable {
@@ -233,6 +178,137 @@ else {
     Write-Miss 'Unity Hub - chua cai'
     Write-Hint 'Tai tai https://unity.com/download (khong tu cai ho duoc vi phai dang nhap license)'
     [void]$blockers.Add('Unity Hub')
+}
+
+# ============================================================
+#  VAI TRO CUA MAY NAY
+# ============================================================
+Write-Title 'May nay dong vai gi'
+Write-Host '    [1] May dev   - chi dat lenh build, may khac build ho' -ForegroundColor Gray
+Write-Host '    [2] May build - chay build, khong dat lenh' -ForegroundColor Gray
+Write-Host '    [3] Ca hai    - mot may lam tat (nhu mac dinh truoc gio)' -ForegroundColor Green
+Write-Host ''
+
+$defRole = if ($existing) { "$($existing.role)" } else { 'standalone' }
+$defPick = switch ($defRole) { 'client' { '1' } 'agent' { '2' } default { '3' } }
+$rolePick = if ($CheckOnly) { $defPick } else { Read-Choice 'Chon' $defPick }
+$role = switch ($rolePick) { '1' { 'client' } '2' { 'agent' } default { 'standalone' } }
+Write-Ok "Vai tro: $role"
+
+# ============================================================
+#  DUONG RIENG CHO MAY BUILD
+#  May build khong can cau hinh tung project: gap job cua project la,
+#  no tu clone tu gitRemote kem trong job roi tu tim ban Unity khop.
+# ============================================================
+if ($role -eq 'agent' -and -not $CheckOnly) {
+
+    Write-Title 'Cai dat may build'
+    Write-Info 'May build khong can chon project - no tu clone khi nhan job dau tien.'
+    Write-Host ''
+
+    $agentName = Read-Choice 'Ten may build (hien trong Discord va ci.ps1 status)' $(if ($existing) { "$($existing.agentName)" } else { $env:COMPUTERNAME })
+
+    Write-Host ''
+    Write-Info 'Thu muc lam viec - se chua queue, worktree va file build.'
+    Write-Hint 'Day la thu muc ban se CHIA SE ra mang cho may dev thay.'
+    $agentRoot = ''
+    $defRoot = if ($existing -and (Test-CiRootValid $existing.ciRoot)) { $existing.ciRoot } else { 'C:\UnityCI' }
+    while (-not $agentRoot) {
+        $agentRoot = Resolve-CiRootPath (Read-Choice 'Duong dan' $defRoot)
+        if (-not (Test-CiRootValid $agentRoot)) {
+            Write-Bad 'Can duong dan tuyet doi co o dia, vd C:\UnityCI'
+            $agentRoot = ''
+        }
+    }
+
+    $pollSec = ConvertTo-IntSafe (Read-Choice 'Bao nhieu giay ngo queue mot lan' $(if ($existing) { $existing.pollSeconds } else { 5 })) 5
+    if ($pollSec -lt 2) { $pollSec = 2 }
+
+    $cores = [Environment]::ProcessorCount
+    Write-Host ''
+    Write-Info "May nay co $cores core. Vi la may build chuyen dung, nen chua lai it thoi."
+    $agentReserve = ConvertTo-IntSafe (Read-Choice 'Chua lai bao nhieu core' $(if ($existing) { $existing.reserveCoresForEditor } else { 0 })) 0
+    if ($agentReserve -lt 0) { $agentReserve = 0 }
+    if ($agentReserve -ge $cores) { $agentReserve = $cores - 1 }
+
+    $agentTimeout = ConvertTo-IntSafe (Read-Choice 'Toi da bao nhieu phut thi coi nhu build treo' $(if ($existing) { $existing.buildTimeoutMinutes } else { 90 })) 90
+    if ($agentTimeout -lt 10) { $agentTimeout = 10 }
+
+    # Discord: chinh MAY BUILD la ben gui thong bao, nen webhook phai o day
+    Write-Host ''
+    Write-Info 'Discord: may build la ben gui thong bao, nen webhook cau hinh o day.'
+    $oldSec = Read-CiSecrets
+    $agentDiscord = $false; $agentCipher = ''
+    if (Read-YesNo 'Bat thong bao Discord?' $true) {
+        $cur = Get-Secret $oldSec 'discordWebhook'
+        $url = Read-Choice ("Dan duong dan webhook " + $(if ($cur) { '(Enter de giu cai cu)' } else { '' })) ''
+        if (-not $url -and $cur) { $url = $cur }
+        if ($url -match '^https://discord(app)?\.com/api/webhooks/') {
+            Write-Info 'Dang gui thu...'
+            if (Send-DiscordTest -WebhookUrl $url) { Write-Ok 'Da gui' } else { Write-Miss 'Gui that bai - van luu' }
+            $agentDiscord = $true; $agentCipher = Protect-CiString $url
+        } elseif ($url) { Write-Bad 'Khong dung dinh dang webhook - bo qua' }
+    }
+
+    # --- ghi cau hinh ---
+    $agentCfg = [pscustomobject]@{
+        version               = 3
+        role                  = 'agent'
+        agentName             = $agentName
+        canBuild              = @('android')
+        pollSeconds           = $pollSec
+        ciRoot                = $agentRoot
+        reserveCoresForEditor = $agentReserve
+        buildTimeoutMinutes   = $agentTimeout
+        useNographics         = $false
+        discord               = [pscustomobject]@{ enabled = $agentDiscord }
+        defaultProject        = ''
+        projects              = @()
+    }
+    Initialize-CiDirs $agentCfg
+    Write-CiConfig $agentCfg
+    Save-CiSecrets -Secrets $oldSec -DiscordCipher $agentCipher
+    Write-Ok "Da ghi cau hinh, thu muc lam viec: $agentRoot"
+
+    # --- Scheduled Task ---
+    Write-Host ''
+    $taskName = 'UnityCIBuildAgent'
+    $runnerPs = Join-CiPath (Get-ToolDir) 'runner.ps1'
+    $taskOk = $false
+    if (Read-YesNo 'Tao Scheduled Task de agent tu chay khi dang nhap?' $true) {
+        try {
+            $act  = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                        -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Watch' -f $runnerPs)
+            $trg  = New-ScheduledTaskTrigger -AtLogOn
+            $set  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
+            Register-ScheduledTask -TaskName $taskName -Action $act -Trigger $trg -Settings $set -Force -ErrorAction Stop | Out-Null
+            Write-Ok "Da tao Scheduled Task '$taskName'"
+            $taskOk = $true
+        } catch {
+            Write-Bad "Tao Scheduled Task that bai: $($_.Exception.Message)"
+            Write-Hint 'Khong sao - van chay tay bang agent.bat duoc.'
+        }
+    }
+
+    Write-Host ''
+    Write-Host '  ============================================================' -ForegroundColor Green
+    Write-Host '    MAY BUILD DA SAN SANG' -ForegroundColor Green
+    Write-Host '  ============================================================' -ForegroundColor Green
+    Write-Host ''
+    Write-Host '  CON MOT VIEC PHAI LAM TAY: chia se thu muc ra mang' -ForegroundColor White
+    Write-Host "    1. Chuot phai $agentRoot > Properties > Sharing > Share..." -ForegroundColor Gray
+    Write-Host '    2. Them tai khoan may dev, cap quyen Read/Write' -ForegroundColor Gray
+    Write-Host ("    3. Tren may dev, dat thu muc CI la:  \\{0}\{1}" -f $env:COMPUTERNAME, (Split-Path -Leaf $agentRoot)) -ForegroundColor Gray
+    Write-Host ''
+    if ($taskOk) {
+        Write-Host '  Agent se tu chay moi lan DANG NHAP vao may nay.' -ForegroundColor Gray
+        Write-Host '  Nen bat auto-login cho may build, vi Unity can mot phien dang nhap that' -ForegroundColor Gray
+        Write-Host '  moi build on dinh - chay nhu dich vu nen de vo o khau compile shader.' -ForegroundColor Gray
+    }
+    Write-Host '  Chay tay / xem log truc tiep: double-click agent.bat' -ForegroundColor Gray
+    Write-Host '  Dung agent: tao file agent-stop.flag trong thu muc lam viec' -ForegroundColor Gray
+    Write-Host ''
+    exit 0
 }
 
 # ============================================================
@@ -670,6 +746,7 @@ $buildsPath   = Join-CiPath $ciRoot "builds"   $projectName
 $projEntry = [pscustomobject]@{
     name         = $projectName
     projectPath  = $projectPath
+    gitRemote    = (Get-GitRemoteUrl $projectPath)
     unityExe     = $unityExe
     unityVersion = $unityVer
     worktreePath = $worktreePath
@@ -692,7 +769,11 @@ if ($existing) {
 [void]$projects.Add($projEntry)
 
 $cfg = [pscustomobject]@{
-    version               = 2
+    version               = 3
+    role                  = $role
+    agentName             = $(if ($existing) { "$($existing.agentName)" } else { $env:COMPUTERNAME })
+    canBuild              = @('android')
+    pollSeconds           = $(if ($existing) { $existing.pollSeconds } else { 5 })
     ciRoot                = $ciRoot
     reserveCoresForEditor = $reserve
     buildTimeoutMinutes   = $timeout
@@ -706,7 +787,8 @@ Initialize-CiDirs (Get-EffectiveConfig $cfg $projectName)
 Write-Ok "Da tao thu muc tai $ciRoot"
 
 # --- worktree ---
-if ($git) {
+# Vai tro client thi may khac build, khong can ban sao thu hai o day
+if ($git -and $role -ne 'client') {
     $exists = $false
     try {
         $wl = (& git -C $projectPath worktree list 2>$null) -join "`n"

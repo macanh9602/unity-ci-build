@@ -73,6 +73,43 @@ Nếu chọn rclone thì wizard tự chạy `rclone config create gdrive drive s
 .\ci.ps1 doctor                             # kiểm tra lại máy
 ```
 
+### Build trên máy khác (LAN)
+
+Một máy đặt lệnh, một máy khác build. Máy dev không đụng gì tới CPU nữa.
+
+```
+MAY DEV (client)                    MAY BUILD (agent)
+  Unity menu / ci.ps1                 runner.ps1 -Watch chạy thường trực
+        │                                    │
+        └──► \\BUILDPC\UnityCI\queue ◄──────┘  ngó queue mỗi 5 giây
+                      │
+                      ▼
+             clone từ git remote ──► Unity batchmode ──► APK + Discord
+```
+
+**Cài đặt:** chạy `install.bat` trên **cả hai máy**, chọn vai trò khác nhau:
+
+| | Chọn | Cần nhập gì |
+|---|---|---|
+| Máy dev | `[1] May dev` | Project Unity, đường dẫn CI trỏ vào share `\\BUILDPC\UnityCI` |
+| Máy build | `[2] May build` | Chỉ thư mục làm việc + webhook Discord — **không cần chọn project** |
+
+Máy build tự nhận project: gặp job của project lạ, nó clone từ `gitRemote` kèm trong job, đọc `ProjectVersion.txt` để biết bản Unity, tìm editor khớp rồi tự ghi vào config của nó. Thêm project mới chỉ phải cấu hình ở máy dev.
+
+Wizard tự tạo Scheduled Task để agent chạy khi đăng nhập. **Nên bật auto-login cho máy build** — Unity cần một phiên đăng nhập thật mới build ổn định, chạy kiểu dịch vụ nền hay vỡ ở khâu compile shader.
+
+**Ba điều khác biệt so với chạy một máy:**
+
+**Commit chưa push thì bị chặn.** Máy build clone từ remote nên không thấy commit local. `ci.ps1 build` fetch rồi kiểm tra trước khi xếp hàng — chưa push thì báo ngay, không để build chạy rồi mới chết.
+
+**Webhook Discord nằm ở máy build**, không phải máy dev — vì máy build mới là bên gửi thông báo.
+
+**Job được giành bằng cách đổi tên file** (`queue/` → `processing/<tên-agent>/`). Rename là thao tác nguyên tử kể cả trên ổ mạng, nên hai agent nhảy vào cùng một job thì một cái thất bại và bỏ qua. Khoá mutex cũ chỉ chặn được trong phạm vi một máy.
+
+`ci.ps1 status` hiện máy build còn sống hay đã chết (agent ghi nhịp tim mỗi vòng lặp; im quá 60 giây là coi như chết). Dừng agent: tạo file `agent-stop.flag` trong thư mục làm việc.
+
+**Về iOS:** job đã mang sẵn trường `platform` và agent khai `canBuild`, nên khi thêm một con Mac thì agent Mac chỉ nhặt job iOS, agent Windows chỉ nhặt job Android — không phải sửa lại cấu trúc. Nhưng phần build iOS thật (Xcode, signing, `.ipa`) thì chưa làm.
+
 ### Nhiều project
 
 Chạy lại `install.bat` và chọn project khác là nó **thêm vào**, không đè lên cái cũ. Chọn lại project đã có thì là **sửa**. Wizard tự nhận biết bằng đường dẫn.

@@ -80,6 +80,36 @@ function Write-JsonFile([string]$Path, $Object) {
 #  Cai dat CHUNG (o dia, so core, timeout, Discord) dung chung moi project.
 #  Rieng tung project: duong dan, Unity, noi do file, keystore.
 
+function Test-CiHasProp { param($Obj, [string]$Name) if (-not $Obj) { return $false } ; return ($Obj.PSObject.Properties.Name -contains $Name) }
+
+# v3 them khai niem VAI TRO, de mot may co the chi dat lenh con may khac build.
+#   standalone - mot may lam ca hai (nhu truoc gio)
+#   client     - chi day job vao queue, khong build
+#   agent      - chi build, khong dat lenh
+function ConvertTo-CiConfigV3 {
+    param($Cfg)
+    if (-not $Cfg) { return $null }
+    if (-not (Test-CiHasProp $Cfg 'role')) {
+        Add-Member -InputObject $Cfg -NotePropertyName role      -NotePropertyValue 'standalone' -Force
+    }
+    if (-not (Test-CiHasProp $Cfg 'agentName')) {
+        Add-Member -InputObject $Cfg -NotePropertyName agentName -NotePropertyValue $env:COMPUTERNAME -Force
+    }
+    if (-not (Test-CiHasProp $Cfg 'canBuild')) {
+        Add-Member -InputObject $Cfg -NotePropertyName canBuild  -NotePropertyValue @('android') -Force
+    }
+    if (-not (Test-CiHasProp $Cfg 'pollSeconds')) {
+        Add-Member -InputObject $Cfg -NotePropertyName pollSeconds -NotePropertyValue 5 -Force
+    }
+    foreach ($p in $Cfg.projects) {
+        if (-not (Test-CiHasProp $p 'gitRemote')) {
+            Add-Member -InputObject $p -NotePropertyName gitRemote -NotePropertyValue '' -Force
+        }
+    }
+    Add-Member -InputObject $Cfg -NotePropertyName version -NotePropertyValue 3 -Force
+    return $Cfg
+}
+
 function ConvertTo-CiConfigV2 {
     param($Cfg)
     if (-not $Cfg) { return $null }
@@ -114,8 +144,9 @@ function Read-CiConfig {
     $c = Read-JsonFile $p
     if (-not $c) { throw "Chua cai dat. Chay install.bat truoc." }
 
-    $needMigrate = -not ($c.PSObject.Properties.Name -contains 'projects')
+    $needMigrate = (-not (Test-CiHasProp $c 'projects')) -or (-not (Test-CiHasProp $c 'role'))
     $c = ConvertTo-CiConfigV2 $c
+    $c = ConvertTo-CiConfigV3 $c
     if ($needMigrate) { try { Write-JsonFile $p $c } catch {} }   # ghi lai mot lan
     return $c
 }
@@ -157,8 +188,12 @@ function Get-EffectiveConfig {
         unityVersion          = $p.unityVersion
         worktreePath          = $p.worktreePath
         buildsPath            = $p.buildsPath
+        gitRemote             = $p.gitRemote
         drive                 = $p.drive
         android               = $p.android
+        role                  = $Cfg.role
+        agentName             = $Cfg.agentName
+        pollSeconds           = $Cfg.pollSeconds
         ciRoot                = $Cfg.ciRoot
         reserveCoresForEditor = $Cfg.reserveCoresForEditor
         buildTimeoutMinutes   = $Cfg.buildTimeoutMinutes
@@ -367,6 +402,53 @@ function Resolve-CiRootPath {
 # Uoc tinh thoi gian build tu cac lan THANH CONG truoc do cua dung
 # project + dung loai build. Dung trung vi de mot lan bat thuong
 # (may ban, build lan dau import lai tu dau) khong keo lech.
+function Test-CiIsAgent  { param($Cfg) "$($Cfg.role)" -in @('agent','standalone') }
+function Test-CiIsClient { param($Cfg) "$($Cfg.role)" -in @('client','standalone') }
+
+# Lay dia chi remote cua repo (de may build biet clone tu dau)
+function Get-GitRemoteUrl {
+    param([string]$RepoPath, [string]$Name = 'origin')
+    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+        $u = & git -C $RepoPath remote get-url $Name 2>$null
+        if ($LASTEXITCODE -ne 0) { return '' }
+        return ("$u").Trim()
+    } catch { return '' } finally { $ErrorActionPreference = $old }
+}
+
+# May build clone tu remote, nen commit CHUA PUSH thi no khong the thay.
+# Phai kiem tra truoc khi xep hang, khong de build chay roi moi chet.
+function Test-CiShaOnRemote {
+    param([string]$RepoPath, [string]$Sha, [switch]$SkipFetch)
+    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+        if (-not $SkipFetch) { & git -C $RepoPath fetch --quiet 2>$null | Out-Null }
+        $out = & git -C $RepoPath branch -r --contains $Sha 2>$null
+        if ($LASTEXITCODE -ne 0) { return $false }
+        return (@($out | Where-Object { "$_".Trim() }).Count -gt 0)
+    } catch { return $false } finally { $ErrorActionPreference = $old }
+}
+
+# Doc nhip tim cua cac agent tren o chung -> biet may build con song khong
+function Get-CiAgents {
+    param($Cfg)
+    try {
+        $dir = Join-CiPath $Cfg.ciRoot 'agents'
+        if (-not (Test-Path $dir)) { return @() }
+        $out = New-Object System.Collections.ArrayList
+        foreach ($f in (Get-ChildItem -Path $dir -Filter '*.json' -ErrorAction SilentlyContinue)) {
+            $a = Read-JsonFile $f.FullName
+            if (-not $a) { continue }
+            $age = 99999
+            try { $age = ((Get-Date) - [datetime]$a.lastSeen).TotalSeconds } catch {}
+            Add-Member -InputObject $a -NotePropertyName AgeSeconds -NotePropertyValue $age -Force
+            Add-Member -InputObject $a -NotePropertyName Alive      -NotePropertyValue ($age -lt 60) -Force
+            [void]$out.Add($a)
+        }
+        return $out.ToArray()
+    } catch { return @() }
+}
+
 function Get-CiEtaSeconds {
     param($Config, [string]$ProjectName, [string]$Format, [string]$BuildConfig, [int]$Samples = 5)
     try {

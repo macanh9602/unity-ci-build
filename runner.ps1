@@ -3,7 +3,10 @@
 #  Khong goi truc tiep - ci.ps1 / Unity Editor tu spawn file nay.
 # ============================================================
 [CmdletBinding()]
-param([switch]$Once)
+param(
+    [switch]$Once,     # chi xu ly het queue mot lan roi thoat
+    [switch]$Watch     # che do agent: chay thuong truc, cu vai giay ngo queue
+)
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib\Common.ps1')
@@ -11,6 +14,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib\UnityLog.ps1')
 . (Join-Path $PSScriptRoot 'lib\Discord.ps1')
 . (Join-Path $PSScriptRoot 'lib\Drive.ps1')
+. (Join-Path $PSScriptRoot 'lib\Unity.ps1')
 Set-ConsoleUtf8
 
 $root    = Read-CiConfig          # cau hinh goc: cai dat chung + danh sach project
@@ -23,16 +27,34 @@ if ($root.discord -and $root.discord.enabled) { $webhook = Get-Secret $secrets '
 
 # ------------------------------------------------------------
 function Sync-Worktree {
-    param($Config, [string]$Sha)
+    param($Config, [string]$Sha, [string]$GitRemote = '')
     $wt = $Config.worktreePath
     if (-not (Test-CiRootValid $wt)) {
         throw ("Cau hinh hong: worktreePath '$wt' khong phai duong dan tuyet doi. " +
                "Chay lai install.bat va nhap duong dan day du nhu E:\UnityCI (dung go moi chu 'E').")
     }
-    if (-not (Test-Path $wt)) {
-        throw ("Khong tim thay worktree: $wt" + [Environment]::NewLine +
-               "Chay lai install.bat de tao lai.")
+    # May build khong co repo goc cua may dev -> clone tu remote.
+    # Worktree cua che do standalone co san roi thi bo qua doan nay.
+    $gitMarker = Join-CiPath $wt '.git'
+    if (-not (Test-Path $gitMarker)) {
+        $remote = if ($GitRemote) { $GitRemote } else { "$($Config.gitRemote)" }
+        if (-not $remote) {
+            throw ("Khong tim thay worktree: $wt" + [Environment]::NewLine +
+                   "Va khong biet clone tu dau (job khong kem gitRemote). Chay lai install.bat.")
+        }
+        $parent = Split-Path -Parent $wt
+        if ($parent -and -not (Test-Path $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+
+        $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        try { & git clone --quiet $remote $wt 2>&1 | Out-Null }
+        finally { $ErrorActionPreference = $old }
+
+        if (-not (Test-Path $gitMarker)) { throw "Clone that bai tu: $remote" }
     }
+
+    # Clone/worktree co san van co the chua co commit moi nhat
+    $r = Invoke-Git $wt @('fetch','--all','--prune','--quiet')
+    if ($r.ExitCode -ne 0) { Write-RunnerLog $Config "canh bao: git fetch exit $($r.ExitCode)" }
 
     # --force + reset --hard: bat buoc, vi build truoc do da sua ProjectSettings.asset
     # (bundleVersionCode, keystore...) -> checkout thuong se bi tu choi.
@@ -156,7 +178,11 @@ function Invoke-CiJob {
     $started = Get-Date
     $logPath = Join-CiPath $paths.Logs   ("{0}.log"        -f $Job.id)
     $errPath = Join-CiPath $paths.Logs   ("{0}.errors.txt" -f $Job.id)
-    $jobFile = Move-CiJobToProcessing $Config $Job
+    $jobFile = Move-CiJobToProcessing -Config $Config -Job $Job -AgentName "$($Config.agentName)"
+    if (-not $jobFile) {
+        Write-RunnerLog $Config "BO QUA $($Job.id): agent khac da nhan truoc"
+        return $false
+    }
 
     Write-RunnerLog $Config "BAT DAU $($Job.id)  [$($Config.projectName)]  $($Job.branch)@$($Job.shaShort)  $($Job.format)/$($Job.config)"
 
@@ -169,7 +195,7 @@ function Invoke-CiJob {
     $success = $false; $failReason = ''; $sizeBytes = 0; $link = ''; $errInfo = $null
 
     try {
-        Sync-Worktree -Config $Config -Sha $Job.sha
+        Sync-Worktree -Config $Config -Sha $Job.sha -GitRemote "$($Job.gitRemote)"
         Copy-CiScript  -Config $Config
 
         # versionCode = so commit tinh den sha nay. Deterministic, khong can file state.
@@ -262,32 +288,143 @@ function Invoke-CiJob {
 }
 
 # ------------------------------------------------------------
+#  Tu nhan project la
+#  May build khong duoc cau hinh san tung project. Khi gap job cua
+#  mot project chua biet, no tu clone tu gitRemote trong job, doc
+#  ProjectVersion.txt de biet ban Unity, roi ghi vao config cua chinh no.
+#  Nho vay them project moi chi phai cau hinh o may dev.
+# ------------------------------------------------------------
+function Register-CiProjectFromJob {
+    param($Root, $Job)
+
+    $name = "$($Job.project)"
+    if (-not $name) { throw "Job khong co ten project" }
+
+    $wt     = Join-CiPath $Root.ciRoot 'worktree' $name
+    $builds = Join-CiPath $Root.ciRoot 'builds'   $name
+    $remote = "$($Job.gitRemote)"
+
+    if (-not (Test-Path (Join-CiPath $wt '.git'))) {
+        if (-not $remote) { throw "Project '$name' chua duoc cau hinh va job khong kem gitRemote" }
+        Write-RunnerLog $Root "tu nhan project moi '$name' - dang clone tu $remote"
+        $parent = Split-Path -Parent $wt
+        if ($parent -and -not (Test-Path $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+        $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        try { & git clone --quiet $remote $wt 2>&1 | Out-Null } finally { $ErrorActionPreference = $old }
+        if (-not (Test-Path (Join-CiPath $wt '.git'))) { throw "Clone that bai tu: $remote" }
+    }
+
+    $ver = Get-ProjectUnityVersion $wt
+    if (-not $ver) { $ver = "$($Job.unityVersion)" }
+    $exe = Resolve-UnityExe $ver
+    if (-not $exe) {
+        throw ("May nay chua cai Unity $ver (project '$name' can ban do). " +
+               "Mo Unity Hub cai dung ban, kem Android Build Support.")
+    }
+
+    $entry = [pscustomobject]@{
+        name         = $name
+        projectPath  = ''          # may build khong co repo goc cua may dev
+        gitRemote    = $remote
+        unityExe     = $exe
+        unityVersion = $ver
+        worktreePath = $wt
+        buildsPath   = $builds
+        drive        = [pscustomobject]@{ mode='none'; folderPath=''; shareUrl=''; rclonePath=''; remote=''; folder=''; rootFolderId=''; makeLink=$true }
+        android      = [pscustomobject]@{ keystorePath=''; keyaliasName='' }
+    }
+
+    $list = New-Object System.Collections.ArrayList
+    foreach ($p in $Root.projects) { if ($p.name -ne $name) { [void]$list.Add($p) } }
+    [void]$list.Add($entry)
+    $Root.projects = $list.ToArray()
+    try { Write-CiConfig $Root } catch {}
+
+    Write-RunnerLog $Root "da dang ky project '$name' voi Unity $ver"
+    return (Get-EffectiveConfig $Root $name)
+}
+
+function Resolve-CiJobConfig {
+    param($Root, $Job)
+    $p = $Root.projects | Where-Object { $_.name -eq "$($Job.project)" } | Select-Object -First 1
+    if ($p -and $p.unityExe -and (Test-Path $p.unityExe) -and (Test-Path (Join-CiPath $p.worktreePath '.git'))) {
+        return (Get-EffectiveConfig $Root "$($Job.project)")
+    }
+    return (Register-CiProjectFromJob $Root $Job)
+}
+
+# Nhip tim cua agent - de may dev biet agent con song hay da chet
+function Write-CiHeartbeat {
+    param($Root, [string]$State = 'idle', [string]$JobId = '')
+    try {
+        $dir = Join-CiPath $Root.ciRoot 'agents'
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        Write-JsonFile (Join-CiPath $dir ("{0}.json" -f $Root.agentName)) ([pscustomobject]@{
+            name     = $Root.agentName
+            state    = $State
+            jobId    = $JobId
+            canBuild = @($Root.canBuild)
+            lastSeen = (Get-Date).ToString('o')
+        })
+    } catch {}
+}
+
+# ------------------------------------------------------------
 #  Vong chinh
 # ------------------------------------------------------------
+if ("$($root.role)" -eq 'client') {
+    Write-RunnerLog $root 'May nay dat vai tro client - khong build. Thoat.'
+    exit 0
+}
+
 $lock = Enter-CiRunnerLock
 if (-not $lock) {
     Write-RunnerLog $root 'Da co runner khac dang chay - job van nam trong queue'
     exit 0
 }
 
-try {
-    while ($true) {
-        $queue = @(Get-CiQueue $root)
-        if ($queue.Count -eq 0) { break }
-        $job = $queue[0]
+$stopFlag = Join-CiPath $root.ciRoot 'agent-stop.flag'
+$poll     = [int]$root.pollSeconds
+if ($poll -lt 2) { $poll = 5 }
 
-        # Mot queue chung cho moi project, mot runner, mot khoa.
-        # Co y nhu vay: hai ban Unity build cung luc tren mot may thi
-        # giành CPU va o cung, ca hai deu cham hon la chay lan luot.
-        try {
-            $jobCfg = Get-EffectiveConfig $root "$($job.project)"
-        } catch {
-            Write-RunnerLog $root "BO QUA $($job.id): khong tra duoc project '$($job.project)'"
-            Remove-Item -LiteralPath $job._file -Force -ErrorAction SilentlyContinue
+try {
+    if ($Watch) { Write-RunnerLog $root "AGENT '$($root.agentName)' bat dau - build duoc: $(@($root.canBuild) -join ', ')" }
+
+    while ($true) {
+        if ($Watch -and (Test-Path $stopFlag)) {
+            Write-RunnerLog $root 'Thay agent-stop.flag - dung agent'
+            break
+        }
+
+        $queue = @(Get-CiQueue $root)
+        $job   = Select-CiJobForAgent $root $queue
+
+        if (-not $job) {
+            if (-not $Watch) { break }
+            Write-CiHeartbeat $root 'idle'
+            Start-Sleep -Seconds $poll
+            # nap lai config moi vong: doi cai dat khong phai khoi dong lai agent
+            try { $root = Read-CiConfig } catch {}
             continue
         }
 
+        try {
+            $jobCfg = Resolve-CiJobConfig $root $job
+        } catch {
+            Write-RunnerLog $root "BO QUA $($job.id): $($_.Exception.Message)"
+            # day sang failed/ de khong lap vo han tren cung mot job hong
+            try {
+                $failDir = Join-CiPath $root.ciRoot 'failed'
+                if (-not (Test-Path $failDir)) { New-Item -ItemType Directory -Force -Path $failDir | Out-Null }
+                Move-Item -LiteralPath $job._file -Destination (Join-CiPath $failDir ("{0}.json" -f $job.id)) -Force
+            } catch {}
+            continue
+        }
+
+        Write-CiHeartbeat $root 'building' $job.id
         Invoke-CiJob -Config $jobCfg -Job $job -Secrets $secrets -Webhook $webhook | Out-Null
+        Write-CiHeartbeat $root 'idle'
+
         if ($Once) { break }
     }
 } catch {
