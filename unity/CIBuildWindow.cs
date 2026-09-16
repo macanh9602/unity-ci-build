@@ -17,10 +17,20 @@ namespace VTL.CI
 {
     [Serializable] class CiLink   { public string toolDir; }
 
+    [Serializable] class CiAgentView
+    {
+        public string name;
+        public string state;
+        public string jobId;
+        public string[] canBuild;
+        public string lastSeen;
+    }
+
     [Serializable] class CiProjectEntry
     {
         public string name;
         public string projectPath;
+        public string gitRemote;
         public string unityVersion;
         public string worktreePath;
         public string buildsPath;
@@ -29,6 +39,8 @@ namespace VTL.CI
     [Serializable] class CiConfig
     {
         public int    version;
+        public string role;
+        public string agentName;
         public string ciRoot;
         public string defaultProject;
         public CiProjectEntry[] projects;
@@ -40,10 +52,21 @@ namespace VTL.CI
         public string buildsPath;
     }
 
+    [Serializable] class CiJobView
+    {
+        public string id;
+        public string project;
+        public string branch;
+        public string shaShort;
+        public string format;
+        public string config;
+    }
+
     [Serializable] class CiResultView
     {
         public string id;
         public string project;
+        public bool   cancelled;
         public bool   success;
         public string branch;
         public string shaShort;
@@ -63,7 +86,8 @@ namespace VTL.CI
         string          _toolDir;
         CiConfig        _cfg;
         CiProjectEntry  _proj;
-        DropdownField _formatField, _configField;
+        DropdownField _formatField, _configField, _branchField;
+        VisualElement _cancelRow;
         Label        _headLabel, _stateLabel;
         HelpBox      _dirtyBox, _errorBox;
         ScrollView   _history;
@@ -128,10 +152,16 @@ namespace VTL.CI
             _dirtyBox = new HelpBox("", HelpBoxMessageType.Info) { style = { display = DisplayStyle.None } };
             root.Add(_dirtyBox);
 
+            _branchField = new DropdownField("Branch", new List<string> { "..." }, 0);
+            _branchField.tooltip = "Chon branch khac de build ma KHONG doi working copy dang mo";
+            root.Add(_branchField);
+
             _formatField = new DropdownField("Dinh dang", new List<string> { "APK", "AAB" }, 0);
             _configField = new DropdownField("Ban",       new List<string> { "dev", "release" }, 0);
             root.Add(_formatField);
             root.Add(_configField);
+
+            RefreshBranches();
 
             var buildBtn = new Button(OnBuildClicked) { text = "Build (chay nen)" };
             buildBtn.style.height = 32;
@@ -143,6 +173,9 @@ namespace VTL.CI
 
             _errorBox = new HelpBox("", HelpBoxMessageType.Error) { style = { display = DisplayStyle.None } };
             root.Add(_errorBox);
+
+            _cancelRow = new VisualElement { style = { flexDirection = FlexDirection.Row, marginTop = 4, display = DisplayStyle.None } };
+            root.Add(_cancelRow);
 
             var row = new VisualElement { style = { flexDirection = FlexDirection.Row, marginTop = 4 } };
             row.Add(new Button(() => EditorUtility.RevealInFinder(_proj.buildsPath)) { text = "Mo thu muc build", style = { flexGrow = 1 } });
@@ -162,6 +195,16 @@ namespace VTL.CI
             var git = GetGit();
             if (git == null) { ShowError("Khong doc duoc git tai " + _proj.projectPath); return; }
 
+            // Chon branch khac -> lay dinh cua branch do, khong doi working copy
+            var wantBranch = _branchField != null ? _branchField.value : null;
+            if (!string.IsNullOrEmpty(wantBranch) && wantBranch != git.Branch)
+            {
+                Git(_proj.projectPath, "fetch --quiet");
+                var tip = ReadGitForBranch(_proj.projectPath, wantBranch);
+                if (tip == null) { ShowError("Khong tim thay branch '" + wantBranch + "'"); return; }
+                git = tip;
+            }
+
             if (git.Dirty)
             {
                 bool go = EditorUtility.DisplayDialog("Co thay doi chua commit",
@@ -172,16 +215,110 @@ namespace VTL.CI
 
             try
             {
+                var target = AskWhereToBuild(_cfg);
+                if (target == null) return;                      // nguoi dung huy
+
                 var job = Enqueue(_toolDir, _cfg, _proj, git,
                                   _formatField.value.ToLower(),
                                   _configField.value,
-                                  "unity-editor");
-                StartRunner(_toolDir);
+                                  "unity-editor", target);
+
+                // Chi tu khoi dong runner khi build tai chinh may nay
+                if (!string.IsNullOrEmpty(target)) StartRunner(_toolDir);
+
                 ShowError("");
-                _stateLabel.text = "Da xep hang " + job + " - dang build nen...";
+                _stateLabel.text = string.IsNullOrEmpty(target)
+                    ? "Da gui sang may build: " + job
+                    : "Da xep hang " + job + " - dang build nen tai may nay...";
                 Refresh();
             }
             catch (Exception e) { ShowError(e.Message); }
+        }
+
+        // Nap danh sach branch, giu nguyen lua chon hien tai neu con
+        void RefreshBranches()
+        {
+            if (_branchField == null || _proj == null) return;
+            var keep = _branchField.value;
+            var list = Branches(_proj.projectPath);
+            if (list.Count == 0) return;
+
+            _branchField.choices = list;
+            if (!string.IsNullOrEmpty(keep) && list.Contains(keep)) _branchField.value = keep;
+            else
+            {
+                var git = ReadGit(_proj.projectPath);
+                var cur = git != null ? git.Branch : null;
+                _branchField.value = (!string.IsNullOrEmpty(cur) && list.Contains(cur)) ? cur : list[0];
+            }
+        }
+
+        static List<string> Branches(string repo)
+        {
+            var list = new List<string>();
+            try
+            {
+                var raw = Git(repo, "for-each-ref --format=%(refname:short) refs/heads refs/remotes");
+                foreach (var line in raw.Split('\n'))
+                {
+                    var n = line.Trim();
+                    if (n.Length == 0 || n.EndsWith("/HEAD")) continue;
+                    if (n.StartsWith("origin/")) n = n.Substring(7);
+                    if (!list.Contains(n)) list.Add(n);
+                }
+            }
+            catch { }
+            return list;
+        }
+
+        // Dinh cua mot branch, khong dong den working copy
+        static GitInfo ReadGitForBranch(string repo, string branch)
+        {
+            foreach (var r in new[] { branch, "origin/" + branch })
+            {
+                try
+                {
+                    var sha = Git(repo, "rev-parse --verify --quiet " + r + "^{commit}");
+                    if (string.IsNullOrEmpty(sha) || sha.Length < 7) continue;
+                    return new GitInfo
+                    {
+                        Sha      = sha,
+                        ShaShort = sha.Substring(0, 7),
+                        Branch   = branch,
+                        Subject  = Git(repo, "log -1 --pretty=%s " + sha),
+                        Dirty    = false,   // build branch khac -> file chua commit khong lien quan
+                        Count    = int.TryParse(Git(repo, "rev-list --count " + sha), out var c) ? c : 0
+                    };
+                }
+                catch { }
+            }
+            return null;
+        }
+
+        void RefreshCancelRow()
+        {
+            if (_cancelRow == null) return;
+            _cancelRow.Clear();
+
+            var jobs = RunningJobs(_cfg, _proj.name);
+            if (jobs.Count == 0) { _cancelRow.style.display = DisplayStyle.None; return; }
+            _cancelRow.style.display = DisplayStyle.Flex;
+
+            foreach (var j in jobs)
+            {
+                var job = j;
+                var btn = new Button(() =>
+                {
+                    if (!EditorUtility.DisplayDialog("Huy build",
+                            "Dung build " + job.id + " (" + job.branch + "@" + job.shaShort + ")?\n\n" +
+                            "Unity tren may build se bi dung ngay.",
+                            "Huy build", "Khong")) return;
+                    RequestCancel(_cfg, job.id);
+                    _stateLabel.text = "Da yeu cau dung " + job.id + "...";
+                })
+                { text = "Huy " + job.branch + "@" + job.shaShort, style = { flexGrow = 1 } };
+                _cancelRow.Add(btn);
+            }
         }
 
         void ShowError(string msg)
@@ -218,6 +355,8 @@ namespace VTL.CI
                 ? "DANG BUILD" + (queued > 0 ? "  (+" + queued + " cho)" : "")
                 : (queued > 0 ? queued + " job dang cho" : "Ranh");
 
+            RefreshBranches();
+            RefreshCancelRow();
             RefreshHistory();
         }
 
@@ -245,10 +384,11 @@ namespace VTL.CI
                     style = { flexDirection = FlexDirection.Row, marginBottom = 2, alignItems = Align.Center }
                 };
 
-                var dot = new Label(r.success ? "OK" : "X")
+                var dot = new Label(r.success ? "OK" : (r.cancelled ? "-" : "X"))
                 {
                     style = { width = 22, unityFontStyleAndWeight = FontStyle.Bold,
-                              color = new StyleColor(r.success ? new Color(.3f,.8f,.4f) : new Color(.9f,.35f,.35f)) }
+                              color = new StyleColor(r.success ? new Color(.3f,.8f,.4f)
+                                                   : (r.cancelled ? new Color(.55f,.55f,.55f) : new Color(.9f,.35f,.35f))) }
                 };
                 row.Add(dot);
 
@@ -346,6 +486,89 @@ namespace VTL.CI
             return list[0];
         }
 
+        static bool IsAgentRole(CiConfig cfg)
+        {
+            var r = cfg != null ? cfg.role : null;
+            return string.IsNullOrEmpty(r) || r == "agent" || r == "standalone";
+        }
+
+        // Doc nhip tim cac agent tren o chung. Im qua 60 giay thi coi nhu chet.
+        static List<CiAgentView> LiveAgents(CiConfig cfg, string platform)
+        {
+            var list = new List<CiAgentView>();
+            try
+            {
+                var dir = Path.Combine(cfg.ciRoot, "agents");
+                if (!Directory.Exists(dir)) return list;
+                foreach (var f in Directory.GetFiles(dir, "*.json"))
+                {
+                    CiAgentView a;
+                    try { a = JsonUtility.FromJson<CiAgentView>(File.ReadAllText(f)); } catch { continue; }
+                    if (a == null) continue;
+                    DateTime seen;
+                    if (!DateTime.TryParse(a.lastSeen, out seen)) continue;
+                    if ((DateTime.Now - seen).TotalSeconds >= 60) continue;
+                    if (a.canBuild != null && Array.IndexOf(a.canBuild, platform) < 0) continue;
+                    list.Add(a);
+                }
+            }
+            catch { }
+            return list;
+        }
+
+        // Tra ve: "" = gui sang may build, "<ten may>" = build tai may nay, null = huy
+        static string AskWhereToBuild(CiConfig cfg)
+        {
+            if (IsAgentRole(cfg)) return cfg.agentName;          // standalone: build tai cho
+            if (LiveAgents(cfg, "android").Count > 0) return "";  // co may build
+
+            int c = EditorUtility.DisplayDialogComplex(
+                "Khong thay may build",
+                "Khong co may build nao dang chay.\n\n" +
+                "De trong queue: may build bat len la tu chay.\n\n" +
+                "Build tai may nay: Editor van dung duoc, nhung may se an gan het CPU. " +
+                "Lan dau con phai tai ve va import lai toan bo asset (20-40 phut).",
+                "De trong queue", "Huy", "Build tai may nay");
+
+            if (c == 0) return "";              // queue
+            if (c == 2) return cfg.agentName;   // tai cho
+            return null;                        // huy
+        }
+
+        // Huy build: khong giet tien trinh tu xa duoc (co the dang chay o may khac),
+        // nen dat mot file co - runner nhat o vong poll 3 giay san co cua no.
+        static void RequestCancel(CiConfig cfg, string jobId)
+        {
+            try
+            {
+                var dir = Path.Combine(cfg.ciRoot, "cancel");
+                Directory.CreateDirectory(dir);
+                File.WriteAllText(Path.Combine(dir, jobId + ".flag"), DateTime.Now.ToString("o"));
+            }
+            catch (Exception e) { Debug.LogError("[CI] Khong huy duoc: " + e.Message); }
+        }
+
+        // Job dang chay = file nam trong processing/<agent>/
+        static List<CiJobView> RunningJobs(CiConfig cfg, string projectName)
+        {
+            var list = new List<CiJobView>();
+            try
+            {
+                var dir = Path.Combine(cfg.ciRoot, "processing");
+                if (!Directory.Exists(dir)) return list;
+                foreach (var f in Directory.GetFiles(dir, "*.json", SearchOption.AllDirectories))
+                {
+                    CiJobView j;
+                    try { j = JsonUtility.FromJson<CiJobView>(File.ReadAllText(f)); } catch { continue; }
+                    if (j == null || string.IsNullOrEmpty(j.id)) continue;
+                    if (!string.IsNullOrEmpty(projectName) && j.project != projectName) continue;
+                    list.Add(j);
+                }
+            }
+            catch { }
+            return list;
+        }
+
         static string LoadToolDir()
         {
             try
@@ -383,18 +606,27 @@ namespace VTL.CI
                     "Build lay dung commit HEAD, nhung thay doi chua commit se khong co trong ban build.\n\nVan build?",
                     "Build tu HEAD", "Huy")) return;
 
-            var id = Enqueue(toolDir, cfg, proj, git, format, config, "unity-menu");
-            StartRunner(toolDir);
-            Debug.Log("[CI] Da xep hang " + id + " [" + proj.name + "] - dang build nen, Editor van dung duoc binh thuong.");
+            var target = AskWhereToBuild(cfg);
+            if (target == null) return;
+
+            var id = Enqueue(toolDir, cfg, proj, git, format, config, "unity-menu", target);
+            if (!string.IsNullOrEmpty(target)) StartRunner(toolDir);
+
+            Debug.Log("[CI] Da xep hang " + id + " [" + proj.name + "]" +
+                      (string.IsNullOrEmpty(target) ? " - da gui sang may build." : " - dang build nen tai may nay."));
         }
 
-        static string Enqueue(string toolDir, CiConfig cfg, CiProjectEntry proj, GitInfo git, string format, string config, string by)
+        static string Enqueue(string toolDir, CiConfig cfg, CiProjectEntry proj, GitInfo git, string format, string config, string by, string targetAgent)
         {
             var id = DateTime.Now.ToString("yyyyMMdd-HHmmss") + "-" + Guid.NewGuid().ToString("N").Substring(0, 4);
             var job = new CiJob
             {
                 id          = id,
                 project     = proj.name,
+                platform    = "android",
+                targetAgent = targetAgent ?? "",
+                gitRemote   = proj.gitRemote ?? "",
+                unityVersion= proj.unityVersion ?? "",
                 sha         = git.Sha,
                 shaShort    = git.ShaShort,
                 branch      = git.Branch,

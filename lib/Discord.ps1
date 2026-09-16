@@ -116,6 +116,7 @@ function Send-DiscordBuildResult {
         [string]$WebhookUrl,
         $Job,
         [bool]$Success,
+        [bool]$Cancelled = $false,
         [double]$DurationSeconds,
         [string]$OutputPath = '',
         [long]$SizeBytes = 0,
@@ -126,8 +127,9 @@ function Send-DiscordBuildResult {
     )
     if ([string]::IsNullOrWhiteSpace($WebhookUrl)) { return }
 
-    $color = if ($Success) { 3066993 } else { 15158332 }
-    $title = if ($Success) { 'BUILD THANH CONG' } else { 'BUILD THAT BAI' }
+    # Build bi huy khong phai that bai - to mau khac de khoi hoang
+    $color = if ($Success) { 3066993 } elseif ($Cancelled) { 9807270 } else { 15158332 }
+    $title = if ($Success) { 'BUILD THANH CONG' } elseif ($Cancelled) { 'BUILD DA HUY' } else { 'BUILD THAT BAI' }
 
     $branchText = if ($Job.branch) { $Job.branch } else { '-' }
     $fields = @()

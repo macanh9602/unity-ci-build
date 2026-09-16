@@ -21,7 +21,8 @@ function Add-CiJob {
         [string]$Project = '',
         [string]$Platform = 'android',
         [string]$GitRemote = '',
-        [string]$UnityVersion = ''
+        [string]$UnityVersion = '',
+        [string]$TargetAgent = ''
     )
     $paths = Get-CiPaths $Config
     if (-not (Test-Path $paths.Queue)) { New-Item -ItemType Directory -Force -Path $paths.Queue | Out-Null }
@@ -31,6 +32,7 @@ function Add-CiJob {
         id          = $id
         project     = $Project
         platform    = $Platform
+        targetAgent = $TargetAgent
         gitRemote   = $GitRemote
         unityVersion= $UnityVersion
         sha         = $Sha
@@ -86,7 +88,13 @@ function Select-CiJobForAgent {
     param($Config, $Queue)
     $can = @($Config.canBuild)
     if ($can.Count -eq 0) { $can = @('android') }
+    $me = "$($Config.agentName)"
     foreach ($j in $Queue) {
+        # Job ghim cho mot may cu the (nguoi dung chon "build ngay tai may nay")
+        # thi may khac khong duoc cuop
+        $target = "$($j.targetAgent)"
+        if ($target -and $target -ne $me) { continue }
+
         $plat = "$($j.platform)"
         if (-not $plat) { $plat = 'android' }
         if ($can -contains $plat) { return $j }
@@ -99,6 +107,60 @@ function Clear-CiQueue($Config) {
     if (Test-Path $paths.Queue) {
         Get-ChildItem -Path $paths.Queue -Filter '*.json' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
     }
+}
+
+# ------------------------------------------------------------
+#  Huy build
+#  Job dang CHO  -> xoa file la xong.
+#  Job dang CHAY -> khong giet tien trinh tu xa duoc (co the o may khac),
+#                   nen dat mot file co; runner tu nhat o vong poll 3 giay
+#                   san co cua no roi tu giet Unity.
+# ------------------------------------------------------------
+function Get-CiCancelFlagPath {
+    param($Config, [string]$JobId)
+    Join-CiPath (Get-CiPaths $Config).Root 'cancel' ("{0}.flag" -f $JobId)
+}
+
+function Request-CiCancel {
+    param($Config, [string]$JobId)
+    $f = Get-CiCancelFlagPath $Config $JobId
+    $dir = Split-Path -Parent $f
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    Set-Utf8NoBom -Path $f -Text ((Get-Date).ToString('o'))
+}
+
+function Test-CiCancelRequested {
+    param($Config, [string]$JobId)
+    Test-Path (Get-CiCancelFlagPath $Config $JobId)
+}
+
+function Clear-CiCancelFlag {
+    param($Config, [string]$JobId)
+    Remove-Item -LiteralPath (Get-CiCancelFlagPath $Config $JobId) -Force -ErrorAction SilentlyContinue
+}
+
+# Job dang chay = file nam trong processing/<agent>/
+function Get-CiRunningJobs {
+    param($Config)
+    $paths = Get-CiPaths $Config
+    if (-not (Test-Path $paths.Processing)) { return @() }
+    $out = New-Object System.Collections.ArrayList
+    foreach ($f in (Get-ChildItem -Path $paths.Processing -Filter '*.json' -Recurse -ErrorAction SilentlyContinue)) {
+        $j = Read-JsonFile $f.FullName
+        if (-not $j) { continue }
+        Add-Member -InputObject $j -NotePropertyName _file  -NotePropertyValue $f.FullName -Force
+        Add-Member -InputObject $j -NotePropertyName _agent -NotePropertyValue (Split-Path -Leaf (Split-Path -Parent $f.FullName)) -Force
+        [void]$out.Add($j)
+    }
+    return $out.ToArray()
+}
+
+function Remove-CiQueuedJob {
+    param($Config, [string]$JobId)
+    $paths = Get-CiPaths $Config
+    $f = Join-CiPath $paths.Queue ("{0}.json" -f $JobId)
+    if (Test-Path $f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue; return $true }
+    return $false
 }
 
 # ------------------------------------------------------------

@@ -430,6 +430,25 @@ function Test-CiShaOnRemote {
 }
 
 # Doc nhip tim cua cac agent tren o chung -> biet may build con song khong
+# May nay co du do nghe de tu build khong (dung khi may build chet)
+function Test-CiCanBuildLocally {
+    param($Root, $Proj)
+    $r = [pscustomobject]@{ Ok = $false; NeedsWorktree = $false; Reason = '' }
+    if (-not $Proj) { $r.Reason = 'Chua cau hinh project tren may nay'; return $r }
+    if (-not $Proj.unityExe -or -not (Test-Path $Proj.unityExe)) {
+        $r.Reason = "May nay chua cai Unity $($Proj.unityVersion)"
+        return $r
+    }
+    if (-not (Test-Path (Join-CiPath $Proj.worktreePath '.git'))) { $r.NeedsWorktree = $true }
+    $r.Ok = $true
+    return $r
+}
+
+function Get-CiLiveAgents {
+    param($Cfg, [string]$Platform = 'android')
+    @(Get-CiAgents $Cfg) | Where-Object { $_.Alive -and (@($_.canBuild) -contains $Platform) }
+}
+
 function Get-CiAgents {
     param($Cfg)
     try {
@@ -447,6 +466,101 @@ function Get-CiAgents {
         }
         return $out.ToArray()
     } catch { return @() }
+}
+
+# Branch cua lan build gan nhat cua project -> de canh bao khi doi branch
+# Liet ke branch (local + remote), bo tien to origin/ va gop trung
+function Get-CiBranches {
+    param([string]$RepoPath)
+    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+        $out = & git -C $RepoPath for-each-ref --format='%(refname:short)' refs/heads refs/remotes 2>$null
+        if ($LASTEXITCODE -ne 0) { return @() }
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+        $list = New-Object System.Collections.ArrayList
+        foreach ($r in $out) {
+            $n = ("$r").Trim()
+            if (-not $n -or $n.EndsWith('/HEAD')) { continue }
+            if ($n.StartsWith('origin/')) { $n = $n.Substring(7) }
+            if ($seen.Add($n)) { [void]$list.Add($n) }
+        }
+        return $list.ToArray()
+    } catch { return @() } finally { $ErrorActionPreference = $old }
+}
+
+# Lay dinh cua mot branch MA KHONG doi working copy cua nguoi dung.
+# Thu branch local truoc, khong co thi thu origin/<branch>.
+function Resolve-CiBranchTip {
+    param([string]$RepoPath, [string]$Branch)
+    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+        foreach ($ref in @($Branch, "origin/$Branch")) {
+            $sha = & git -C $RepoPath rev-parse --verify --quiet ($ref + '^{commit}') 2>$null
+            if ($LASTEXITCODE -ne 0 -or -not $sha) { continue }
+            $sha = ("$sha").Trim()
+            if ($sha.Length -lt 7) { continue }
+            $subject = & git -C $RepoPath log -1 --pretty=%s $sha 2>$null
+            $count   = & git -C $RepoPath rev-list --count $sha 2>$null
+            return [pscustomobject]@{
+                Sha         = $sha
+                ShaShort    = $sha.Substring(0,7)
+                Branch      = $Branch
+                Subject     = ("$subject").Trim()
+                CommitCount = (ConvertTo-IntSafe $count 0)
+                IsDirty     = $false     # build branch khac -> file chua commit khong lien quan
+                DirtyCount  = 0
+                Ref         = $ref
+            }
+        }
+        return $null
+    } catch { return $null } finally { $ErrorActionPreference = $old }
+}
+
+function Get-CiLastBuiltBranch {
+    param($Config, [string]$ProjectName)
+    try {
+        $paths = Get-CiPaths $Config
+        if (-not (Test-Path $paths.Results)) { return '' }
+        foreach ($f in @(Get-ChildItem -Path $paths.Results -Filter '*.json' -ErrorAction SilentlyContinue |
+                         Sort-Object Name -Descending | Select-Object -First 30)) {
+            $r = Read-JsonFile $f.FullName
+            if ($r -and "$($r.project)" -eq $ProjectName -and $r.branch) { return "$($r.branch)" }
+        }
+    } catch {}
+    return ''
+}
+
+# versionCode = so commit, ma hai branch rat de co cung so commit.
+# Trung versionCode nhung khac commit thi Android coi la cung mot ban,
+# cai chong len khong update -> ngoi test nham ban cu ma khong biet.
+function Get-CiVersionCodeConflict {
+    param($Config, [string]$ProjectName, [int]$VersionCode, [string]$Sha)
+    try {
+        if ($VersionCode -le 0) { return $null }
+        $paths = Get-CiPaths $Config
+        if (-not (Test-Path $paths.Results)) { return $null }
+        foreach ($f in @(Get-ChildItem -Path $paths.Results -Filter '*.json' -ErrorAction SilentlyContinue |
+                         Sort-Object Name -Descending | Select-Object -First 50)) {
+            $r = Read-JsonFile $f.FullName
+            if (-not $r -or -not $r.success) { continue }
+            if ("$($r.project)" -ne $ProjectName) { continue }
+            if ([int]$r.versionCode -ne $VersionCode) { continue }
+            if ("$($r.sha)" -eq $Sha) { continue }     # cung commit thi khong sao
+            return $r
+        }
+    } catch {}
+    return $null
+}
+
+# Ten branch dung lam ten file: bo ky tu Windows khong cho
+function ConvertTo-CiSafeName {
+    param([string]$Name, [int]$Max = 24)
+    $s = ("$Name") -replace '[\\/:*?"<>|\s]', '-'
+    $s = $s -replace '-+', '-'
+    $s = $s.Trim('-')
+    if ($s.Length -gt $Max) { $s = $s.Substring(0, $Max).Trim('-') }
+    if (-not $s) { $s = 'nobranch' }
+    return $s
 }
 
 function Get-CiEtaSeconds {

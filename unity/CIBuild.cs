@@ -17,6 +17,10 @@ namespace VTL.CI
     {
         public string id;
         public string project;
+        public string platform;
+        public string targetAgent;
+        public string gitRemote;
+        public string unityVersion;
         public string sha;
         public string shaShort;
         public string branch;

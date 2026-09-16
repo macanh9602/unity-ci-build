@@ -152,7 +152,14 @@ function Invoke-UnityBuild {
         if ((Get-Date) -gt $timeoutAt) {
             try { $proc.Kill() } catch {}
             try { $proc.WaitForExit(15000) | Out-Null } catch {}
-            return [pscustomobject]@{ ExitCode = -1; TimedOut = $true; Phase = $tracker.Name }
+            return [pscustomobject]@{ ExitCode = -1; TimedOut = $true; Cancelled = $false; Phase = $tracker.Name }
+        }
+
+        # Nguoi dung bam huy -> giet Unity ngay, khong doi het timeout
+        if (Test-CiCancelRequested $Config $Job.id) {
+            try { $proc.Kill() } catch {}
+            try { $proc.WaitForExit(15000) | Out-Null } catch {}
+            return [pscustomobject]@{ ExitCode = -2; TimedOut = $false; Cancelled = $true; Phase = $tracker.Name }
         }
 
         $tracker = Update-CiPhaseTracker $tracker $LogPath
@@ -166,7 +173,7 @@ function Invoke-UnityBuild {
         }
     }
     $proc.WaitForExit()
-    return [pscustomobject]@{ ExitCode = $proc.ExitCode; TimedOut = $false; Phase = $tracker.Name }
+    return [pscustomobject]@{ ExitCode = $proc.ExitCode; TimedOut = $false; Cancelled = $false; Phase = $tracker.Name }
 }
 
 # ------------------------------------------------------------
@@ -192,9 +199,14 @@ function Invoke-CiJob {
     $msgId = ''
     if ($Webhook) { $msgId = Send-DiscordBuildStarted -WebhookUrl $Webhook -Job $Job -EtaSeconds $eta }
 
-    $success = $false; $failReason = ''; $sizeBytes = 0; $link = ''; $errInfo = $null
+    $success = $false; $cancelled = $false; $failReason = ''; $sizeBytes = 0; $link = ''; $errInfo = $null
 
     try {
+        # Huy ngay tu truoc khi Unity kip chay
+        if (Test-CiCancelRequested $Config $Job.id) {
+            $cancelled = $true
+            throw 'Da huy truoc khi build bat dau'
+        }
         Sync-Worktree -Config $Config -Sha $Job.sha -GitRemote "$($Job.gitRemote)"
         Copy-CiScript  -Config $Config
 
@@ -205,14 +217,20 @@ function Invoke-CiJob {
         }
 
         $ext = if ($Job.format -eq 'aab') { 'aab' } else { 'apk' }
-        $Job.outputPath = Join-CiPath $paths.Builds ("{0}-{1}-{2}.{3}" -f $Job.id, $Job.shaShort, $Job.config, $ext)
+        # Kem ten branch vao ten file: hai branch co the co cung so commit
+        # -> cung versionCode, nhin ten file khong the phan biet duoc
+        $brSafe = ConvertTo-CiSafeName "$($Job.branch)"
+        $Job.outputPath = Join-CiPath $paths.Builds ("{0}-{1}-{2}-{3}.{4}" -f $Job.id, $brSafe, $Job.shaShort, $Job.config, $ext)
         $Job | Add-Member -NotePropertyName resultPath -NotePropertyValue (Join-CiPath $paths.Logs ("{0}.unity-result.json" -f $Job.id)) -Force
         Write-JsonFile $jobFile $Job
 
         $run = Invoke-UnityBuild -Config $Config -Job $Job -JobFile $jobFile -LogPath $logPath -Secrets $Secrets `
                                  -Webhook $Webhook -MessageId $msgId -EtaSeconds $eta -StartedAt $started
 
-        if ($run.TimedOut) {
+        if ($run.Cancelled) {
+            $cancelled  = $true
+            $failReason = "Da huy (dang o chang: $($run.Phase))"
+        } elseif ($run.TimedOut) {
             $failReason = "Qua $($Config.buildTimeoutMinutes) phut - da buoc dung Unity (dang o chang: $($run.Phase))"
         } elseif ($run.ExitCode -ne 0) {
             $failReason = "Unity thoat voi ma $($run.ExitCode)"
@@ -240,7 +258,7 @@ function Invoke-CiJob {
         }
     }
 
-    if (-not $success) {
+    if (-not $success -and -not $cancelled) {
         $errInfo = Write-CiErrorReport -LogPath $logPath -OutPath $errPath -Job $Job -Reason $failReason
     }
 
@@ -248,6 +266,7 @@ function Invoke-CiJob {
         id          = $Job.id
         project     = $Config.projectName
         success     = $success
+        cancelled   = $cancelled
         branch      = $Job.branch
         sha         = $Job.sha
         shaShort    = $Job.shaShort
@@ -263,10 +282,11 @@ function Invoke-CiJob {
         finishedAt  = (Get-Date).ToString('o')
         failReason  = $failReason
         logPath     = $logPath
-        errorsPath  = $(if ($success) { '' } else { $errPath })
+        errorsPath  = $(if ($success -or $cancelled) { '' } else { $errPath })
     }
     Write-JsonFile (Join-CiPath $paths.Results ("{0}.json" -f $Job.id)) $result
     Remove-Item -LiteralPath $jobFile -Force -ErrorAction SilentlyContinue
+    Clear-CiCancelFlag $Config $Job.id
 
     if ($Webhook) {
         # Uu tien loi compile (cu the hon). Neu build chet truoc khi Unity kip chay
@@ -275,14 +295,14 @@ function Invoke-CiJob {
         $summaryText = Get-CiErrorSummary $errInfo
         if (-not $summaryText) { $summaryText = $failReason }
 
-        Send-DiscordBuildResult -WebhookUrl $Webhook -Job $Job -Success $success `
+        Send-DiscordBuildResult -WebhookUrl $Webhook -Job $Job -Success $success -Cancelled $cancelled `
             -DurationSeconds $duration -OutputPath $Job.outputPath -SizeBytes $sizeBytes `
-            -ShareLink $link -ErrorSummary $summaryText `
-            -ErrorFile $(if ($success) { '' } else { Split-Path -Leaf $errPath }) `
+            -ShareLink $link -ErrorSummary $(if ($cancelled) { '' } else { $summaryText }) `
+            -ErrorFile $(if ($success -or $cancelled) { '' } else { Split-Path -Leaf $errPath }) `
             -MessageId $msgId
     }
 
-    $tag = if ($success) { 'XONG' } else { 'HONG' }
+    $tag = if ($success) { 'XONG' } elseif ($cancelled) { 'HUY ' } else { 'HONG' }
     Write-RunnerLog $Config "$tag  $($Job.id)  [$($Config.projectName)]  $(Format-Duration $duration)  $failReason"
     return $success
 }
