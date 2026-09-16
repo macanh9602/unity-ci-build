@@ -425,9 +425,9 @@ if ($CheckOnly) {
             [void]$blockers.Add('duong dan thu muc CI')
         }
         foreach ($p in $existing.projects) {
-            if (Test-Path $p.worktreePath) { Write-Ok "Worktree $($p.name): $($p.worktreePath)" }
+            if (Test-CiWorktreeUsable $p.worktreePath) { Write-Ok "Worktree $($p.name): $($p.worktreePath)" }
             else {
-                Write-Bad "Worktree $($p.name) khong ton tai: $($p.worktreePath)"
+                Write-Bad "Worktree $($p.name) khong usable: $($p.worktreePath)"
                 [void]$blockers.Add("worktree $($p.name)")
             }
         }
@@ -817,36 +817,15 @@ Write-Ok "Da tao thu muc tai $ciRoot"
 # --- worktree ---
 # Vai tro client thi may khac build, khong can ban sao thu hai o day
 if ($git -and $role -ne 'client') {
-    $exists = $false
-    try {
-        $wl = (& git -C $projectPath worktree list 2>$null) -join "`n"
-        if ($wl -and $wl.ToLower().Contains($worktreePath.ToLower())) { $exists = $true }
-    } catch {}
-
-    if ($exists -and (Test-Path $worktreePath)) {
-        Write-Ok 'Worktree da co san - dung lai (giu nguyen Library, build sau se nhanh)'
-    } else {
-        # Don dang ky cu tro vao cho khong con ton tai
-        try { & git -C $projectPath worktree prune 2>&1 | Out-Null } catch {}
-
-        Write-Info 'Dang tao ban sao thu hai cua project (worktree)...'
-        if ((Test-Path $worktreePath) -and (Get-ChildItem $worktreePath -Force -ErrorAction SilentlyContinue)) {
-            Write-Bad "Thu muc $worktreePath da ton tai va khong rong."
-            Write-Hint 'Xoa thu muc do roi chay lai, hoac chon o dia khac.'
-            [void]$blockers.Add('worktree')
-        } else {
-            $r = Invoke-Git $projectPath @('worktree','add','--detach',$worktreePath,'HEAD')
-            if ($r.ExitCode -eq 0 -and (Test-Path $worktreePath)) {
-                Write-Ok "Da tao worktree: $worktreePath"
-            } else {
-                Write-Bad "Tao worktree that bai tai: $worktreePath"
-                if ($r.Output) { Write-Info $r.Output }
-                if (-not (Test-CiRootValid $worktreePath)) {
-                    Write-Hint 'Duong dan khong co o dia - chay lai install.bat va nhap vd E:\UnityCI'
-                }
-                [void]$blockers.Add('worktree')
-            }
-        }
+    Write-Info 'Kiem tra CI worktree...'
+    $ok = Ensure-CiWorktree `
+        -CiRoot $ciRoot `
+        -ProjectName $projectName `
+        -ProjectPath $projectPath `
+        -WorktreePath $worktreePath
+    if (-not $ok) {
+        Write-Bad 'Khong the repair/recreate CI worktree.'
+        [void]$blockers.Add('worktree')
     }
 }
 

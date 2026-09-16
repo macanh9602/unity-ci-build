@@ -27,16 +27,30 @@ if ($root.discord -and $root.discord.enabled) { $webhook = Get-Secret $secrets '
 
 # ------------------------------------------------------------
 function Sync-Worktree {
-    param($Config, [string]$Sha, [string]$GitRemote = '')
+    param($Config, [string]$Sha, [string]$GitRemote = '', [int]$RecoveryAttempt = 0)
     $wt = $Config.worktreePath
     if (-not (Test-CiRootValid $wt)) {
         throw ("Cau hinh hong: worktreePath '$wt' khong phai duong dan tuyet doi. " +
                "Chay lai install.bat va nhap duong dan day du nhu E:\UnityCI (dung go moi chu 'E').")
     }
+    # Standalone clone/worktree hop le duoc dung lai binh thuong.
+    # Neu worktree cua standalone co source repo, dung helper self-healing.
+    if (-not (Test-CiWorktreeUsable $wt)) {
+        $sourceUsable = Test-CiWorktreeUsable $Config.projectPath
+        if ($sourceUsable -and (Test-CiOwnedWorktreePath $Config.ciRoot $Config.projectName $Config.projectPath $wt)) {
+            if (-not (Ensure-CiWorktree -CiRoot $Config.ciRoot -ProjectName $Config.projectName `
+                                      -ProjectPath $Config.projectPath -WorktreePath $wt)) {
+                throw "Khong the repair/recreate worktree: $wt"
+            }
+        }
+    }
+
+    if (Test-CiWorktreeUsable $wt) {
+        Write-RunnerLog $Config "WORKTREE REUSE [$($Config.projectName)]"
+    }
+
     # May build khong co repo goc cua may dev -> clone tu remote.
-    # Worktree cua che do standalone co san roi thi bo qua doan nay.
-    $gitMarker = Join-CiPath $wt '.git'
-    if (-not (Test-Path $gitMarker)) {
+    if (-not (Test-CiWorktreeUsable $wt)) {
         $remote = if ($GitRemote) { $GitRemote } else { "$($Config.gitRemote)" }
         if (-not $remote) {
             throw ("Khong tim thay worktree: $wt" + [Environment]::NewLine +
@@ -45,11 +59,26 @@ function Sync-Worktree {
         $parent = Split-Path -Parent $wt
         if ($parent -and -not (Test-Path $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
 
-        $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        try { & git clone --quiet $remote $wt 2>&1 | Out-Null }
-        finally { $ErrorActionPreference = $old }
-
-        if (-not (Test-Path $gitMarker)) { throw "Clone that bai tu: $remote" }
+        if (Test-Path -LiteralPath $wt) {
+            if (-not (Test-CiOwnedWorktreePath $Config.ciRoot $Config.projectName $Config.projectPath $wt)) {
+                throw "Worktree path khong an toan, khong xoa: $wt"
+            }
+            Remove-Item -LiteralPath $wt -Recurse -Force -ErrorAction Stop
+        }
+        $cloneOutput = ''
+        for ($attempt = 1; $attempt -le 2; $attempt++) {
+            $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+            try { $cloneOutput = ((& git clone --quiet $remote $wt 2>&1) | ForEach-Object { "$_" }) -join "`n" }
+            finally { $ErrorActionPreference = $old }
+            if (Test-CiWorktreeUsable $wt) { break }
+            if ($attempt -eq 1 -and (Test-CiOwnedWorktreePath $Config.ciRoot $Config.projectName $Config.projectPath $wt)) {
+                if (Test-Path -LiteralPath $wt) { Remove-Item -LiteralPath $wt -Recurse -Force -ErrorAction Stop }
+            }
+        }
+        if (-not (Test-CiWorktreeUsable $wt)) {
+            if ($cloneOutput) { Write-RunnerLog $Config "CLONE ERROR [$($Config.projectName)]: $cloneOutput" }
+            throw "Clone that bai tu: $remote`n$cloneOutput"
+        }
     }
 
     # Clone/worktree co san van co the chua co commit moi nhat
@@ -59,10 +88,26 @@ function Sync-Worktree {
     # --force + reset --hard: bat buoc, vi build truoc do da sua ProjectSettings.asset
     # (bundleVersionCode, keystore...) -> checkout thuong se bi tu choi.
     $r = Invoke-Git $wt @('checkout','--detach','--force',$Sha)
-    if ($r.ExitCode -ne 0) { throw "git checkout that bai:`n$($r.Output)" }
+    if ($r.ExitCode -ne 0) {
+        if (-not (Test-CiWorktreeUsable $wt) -and $RecoveryAttempt -lt 1) {
+            Write-RunnerLog $Config 'WORKTREE CORRUPT - recreate va retry sync'
+            Remove-CiRunnerWorktreeForRecovery $Config
+            Sync-Worktree -Config $Config -Sha $Sha -GitRemote $GitRemote -RecoveryAttempt 1
+            return
+        }
+        throw "git checkout that bai:`n$($r.Output)"
+    }
 
     $r = Invoke-Git $wt @('reset','--hard',$Sha)
-    if ($r.ExitCode -ne 0) { throw "git reset that bai:`n$($r.Output)" }
+    if ($r.ExitCode -ne 0) {
+        if (-not (Test-CiWorktreeUsable $wt) -and $RecoveryAttempt -lt 1) {
+            Write-RunnerLog $Config 'WORKTREE CORRUPT - recreate va retry sync'
+            Remove-CiRunnerWorktreeForRecovery $Config
+            Sync-Worktree -Config $Config -Sha $Sha -GitRemote $GitRemote -RecoveryAttempt 1
+            return
+        }
+        throw "git reset that bai:`n$($r.Output)"
+    }
 
     # Xoa rac nhung GIU Library/Temp -> build sau chi can import tang dan
     $r = Invoke-Git $wt @('clean','-xdf','-q','-e','Library','-e','Temp','-e','obj','-e','Logs','-e','UserSettings','-e','Builds')
@@ -76,6 +121,123 @@ function Sync-Worktree {
             if ($r.ExitCode -ne 0) { Write-RunnerLog $Config "canh bao: git lfs checkout exit $($r.ExitCode)" }
         }
     }
+}
+
+function Remove-CiRunnerWorktreeForRecovery {
+    param($Config)
+    $wt = $Config.worktreePath
+    $sourceUsable = Test-CiWorktreeUsable $Config.projectPath
+    if ($sourceUsable) {
+        if (-not (Remove-StaleCiWorktree -CiRoot $Config.ciRoot -ProjectName $Config.projectName `
+                                      -ProjectPath $Config.projectPath -WorktreePath $wt)) {
+            throw "Khong the cleanup worktree: $wt"
+        }
+        return
+    }
+    if (-not (Test-CiOwnedWorktreePath $Config.ciRoot $Config.projectName $Config.projectPath $wt)) {
+        throw "Worktree path khong an toan, khong xoa: $wt"
+    }
+    if (Test-Path -LiteralPath $wt) {
+        Remove-Item -LiteralPath $wt -Recurse -Force -ErrorAction Stop
+    }
+    if (Test-Path -LiteralPath $wt) { throw "Khong the xoa worktree: $wt" }
+}
+
+# ------------------------------------------------------------
+# Unity Library cache invalidation.
+# Fingerprint duoc luu NGOAI worktree de git clean khong xoa mat.
+# Moi agent co fingerprint rieng vi moi may co Library rieng.
+function Get-CiUnityEditorVersion {
+    param($Config)
+    try {
+        $v = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($Config.unityExe)
+        if ($v.ProductVersion) { return "$($v.ProductVersion)".Trim() }
+        if ($v.FileVersion)    { return "$($v.FileVersion)".Trim() }
+    } catch {}
+    return "$($Config.unityVersion)".Trim()
+}
+
+function Get-CiCacheFingerprint {
+    param($Config)
+
+    $files = @(
+        [pscustomobject]@{ Name = 'ProjectVersion.txt'; Path = Join-CiPath $Config.worktreePath 'ProjectSettings\ProjectVersion.txt' },
+        [pscustomobject]@{ Name = 'manifest.json';      Path = Join-CiPath $Config.worktreePath 'Packages\manifest.json' },
+        [pscustomobject]@{ Name = 'packages-lock.json'; Path = Join-CiPath $Config.worktreePath 'Packages\packages-lock.json' }
+    )
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = New-Object System.IO.MemoryStream
+    $writer = New-Object System.IO.BinaryWriter($stream, [System.Text.Encoding]::UTF8)
+    try {
+        $writer.Write('UnityCiLibraryFingerprintV1')
+        $writer.Write((Get-CiUnityEditorVersion $Config))
+        foreach ($f in $files) {
+            $writer.Write($f.Name)
+            $exists = Test-Path -LiteralPath $f.Path
+            $writer.Write([bool]$exists)
+            if ($exists) {
+                $bytes = [System.IO.File]::ReadAllBytes($f.Path)
+                $writer.Write([int]$bytes.Length)
+                $writer.Write($bytes)
+            }
+        }
+        $writer.Flush()
+        $hash = $sha.ComputeHash($stream.ToArray())
+        return ([BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
+    } finally {
+        $writer.Dispose()
+        $stream.Dispose()
+        $sha.Dispose()
+    }
+}
+
+function Sync-CiUnityCache {
+    param($Config)
+
+    $library = Join-CiPath $Config.worktreePath 'Library'
+    $temp    = Join-CiPath $Config.worktreePath 'Temp'
+    $obj     = Join-CiPath $Config.worktreePath 'obj'
+    $fpDir   = Join-CiPath $Config.ciRoot 'cache-fingerprints' $Config.agentName
+    $fpPath  = Join-CiPath $fpDir ("{0}.fingerprint" -f $Config.projectName)
+
+    if (-not (Test-Path $fpDir)) { New-Item -ItemType Directory -Force -Path $fpDir | Out-Null }
+
+    $current = Get-CiCacheFingerprint $Config
+    $previous = ''
+    if (Test-Path -LiteralPath $fpPath) {
+        $previous = (Get-Content -LiteralPath $fpPath -Raw -ErrorAction SilentlyContinue).Trim()
+    }
+
+    $libraryExists = Test-Path -LiteralPath $library
+    $hit = $libraryExists -and $previous -and ($previous -eq $current)
+    if ($hit) {
+        Write-RunnerLog $Config "CACHE HIT  [$($Config.projectName)] fp=$($current.Substring(0,12)) - giu nguyen Library/Temp/obj"
+        return
+    }
+
+    $initialize = -not $previous
+    if ($initialize) {
+        $reason = if ($libraryExists) { 'chua co fingerprint' } else { 'Library not present' }
+        Write-RunnerLog $Config "CACHE INITIALIZE [$($Config.projectName)] ($reason)"
+    } elseif ($previous -ne $current) {
+        Write-RunnerLog $Config "CACHE MISS [$($Config.projectName)] reason=fingerprint changed - xoa Library/Temp/obj"
+    } else {
+        Write-RunnerLog $Config "CACHE MISS [$($Config.projectName)] reason=Library missing - xoa Library/Temp/obj"
+    }
+    foreach ($dir in @($library, $temp, $obj)) {
+        if (Test-Path -LiteralPath $dir) {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction Stop
+        }
+    }
+
+    return [pscustomobject]@{ Fingerprint = $current; Path = $fpPath }
+}
+
+function Save-CiUnityCacheFingerprint {
+    param($CacheState, $Config)
+    if (-not $CacheState -or -not $CacheState.Fingerprint -or -not $CacheState.Path) { return }
+    Set-Content -LiteralPath $CacheState.Path -Value $CacheState.Fingerprint -Encoding ASCII
+    Write-RunnerLog $Config "CACHE FINGERPRINT SAVED [$($Config.projectName)] fp=$($CacheState.Fingerprint.Substring(0,12))"
 }
 
 # ------------------------------------------------------------
@@ -152,14 +314,14 @@ function Invoke-UnityBuild {
         if ((Get-Date) -gt $timeoutAt) {
             try { $proc.Kill() } catch {}
             try { $proc.WaitForExit(15000) | Out-Null } catch {}
-            return [pscustomobject]@{ ExitCode = -1; TimedOut = $true; Cancelled = $false; Phase = $tracker.Name }
+            return [pscustomobject]@{ Started = $true; ExitCode = -1; TimedOut = $true; Cancelled = $false; Phase = $tracker.Name }
         }
 
         # Nguoi dung bam huy -> giet Unity ngay, khong doi het timeout
         if (Test-CiCancelRequested $Config $Job.id) {
             try { $proc.Kill() } catch {}
             try { $proc.WaitForExit(15000) | Out-Null } catch {}
-            return [pscustomobject]@{ ExitCode = -2; TimedOut = $false; Cancelled = $true; Phase = $tracker.Name }
+            return [pscustomobject]@{ Started = $true; ExitCode = -2; TimedOut = $false; Cancelled = $true; Phase = $tracker.Name }
         }
 
         $tracker = Update-CiPhaseTracker $tracker $LogPath
@@ -173,7 +335,7 @@ function Invoke-UnityBuild {
         }
     }
     $proc.WaitForExit()
-    return [pscustomobject]@{ ExitCode = $proc.ExitCode; TimedOut = $false; Cancelled = $false; Phase = $tracker.Name }
+    return [pscustomobject]@{ Started = $true; ExitCode = $proc.ExitCode; TimedOut = $false; Cancelled = $false; Phase = $tracker.Name }
 }
 
 # ------------------------------------------------------------
@@ -209,6 +371,7 @@ function Invoke-CiJob {
             throw 'Da huy truoc khi build bat dau'
         }
         Sync-Worktree -Config $Config -Sha $Job.sha -GitRemote "$($Job.gitRemote)"
+        $cacheState = Sync-CiUnityCache -Config $Config
         Copy-CiScript  -Config $Config
 
         # versionCode = so commit tinh den sha nay. Deterministic, khong can file state.
@@ -227,6 +390,12 @@ function Invoke-CiJob {
 
         $run = Invoke-UnityBuild -Config $Config -Job $Job -JobFile $jobFile -LogPath $logPath -Secrets $Secrets `
                                  -Webhook $Webhook -MessageId $msgId -EtaSeconds $eta -StartedAt $started
+
+        # Cache validity depends on Unity completing its process, not on APK success.
+        # Compile/package failures still leave a fully imported Library usable next run.
+        if ($cacheState -and $run.Started -and -not $run.TimedOut -and -not $run.Cancelled) {
+            Save-CiUnityCacheFingerprint -CacheState $cacheState -Config $Config
+        }
 
         if ($run.Cancelled) {
             $cancelled  = $true

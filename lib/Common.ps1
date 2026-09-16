@@ -399,6 +399,176 @@ function Resolve-CiRootPath {
     return $p.TrimEnd('\')
 }
 
+# ---------- worktree safety / recovery ----------
+function Get-CiNormalizedPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    try {
+        return ([System.IO.Path]::GetFullPath($Path)).TrimEnd('\','/').ToLowerInvariant()
+    } catch { return '' }
+}
+
+function Test-CiOwnedWorktreePath {
+    param(
+        [string]$CiRoot,
+        [string]$ProjectName,
+        [string]$ProjectPath,
+        [string]$WorktreePath
+    )
+    $expected = Get-CiNormalizedPath (Join-CiPath $CiRoot 'worktree' $ProjectName)
+    $target   = Get-CiNormalizedPath $WorktreePath
+    $source   = Get-CiNormalizedPath $ProjectPath
+    return ($target -and $expected -and $target -eq $expected -and $target -ne $source)
+}
+
+function Test-GitWorktreeRegistered {
+    param(
+        [string]$ProjectPath,
+        [string]$WorktreePath
+    )
+    if (-not (Test-CiWorktreeUsable -WorktreePath $ProjectPath)) { return $false }
+    $r = Invoke-Git $ProjectPath @('worktree','list','--porcelain')
+    if ($r.ExitCode -ne 0) { return $false }
+    $target = Get-CiNormalizedPath $WorktreePath
+    foreach ($line in ($r.Output -split "`r?`n")) {
+        if ($line -match '^worktree\s+(.+)$' -and (Get-CiNormalizedPath $Matches[1]) -eq $target) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-CiWorktreeUsable {
+    param([string]$WorktreePath)
+    if (-not (Test-Path -LiteralPath $WorktreePath -PathType Container)) { return $false }
+    $r = Invoke-Git $WorktreePath @('rev-parse','--is-inside-work-tree')
+    return ($r.ExitCode -eq 0 -and $r.Output -match 'true')
+}
+
+function Repair-CiWorktree {
+    param(
+        [string]$ProjectPath,
+        [string]$WorktreePath
+    )
+    Write-Host '  WORKTREE REPAIR - attempting' -ForegroundColor Yellow
+    $r = Invoke-Git $ProjectPath @('worktree','repair',$WorktreePath)
+    $ok = ($r.ExitCode -eq 0) -and
+          (Test-GitWorktreeRegistered $ProjectPath $WorktreePath) -and
+          (Test-CiWorktreeUsable $WorktreePath)
+    return [pscustomobject]@{ Success = $ok; Output = $r.Output }
+}
+
+function Remove-StaleCiWorktree {
+    param(
+        [string]$CiRoot,
+        [string]$ProjectName,
+        [string]$ProjectPath,
+        [string]$WorktreePath
+    )
+    if (-not (Test-CiOwnedWorktreePath $CiRoot $ProjectName $ProjectPath $WorktreePath)) {
+        Write-Host "  WORKTREE FAIL - unsafe cleanup path: $WorktreePath" -ForegroundColor Red
+        return $false
+    }
+
+    try {
+        $r = Invoke-Git $ProjectPath @('worktree','remove','--force',$WorktreePath)
+        # Metadata may already be damaged; unregister failure is non-fatal.
+        $null = $r
+    } catch {}
+    try { Invoke-Git $ProjectPath @('worktree','prune') | Out-Null } catch {}
+    try {
+        if (Test-Path -LiteralPath $WorktreePath) {
+            Remove-Item -LiteralPath $WorktreePath -Recurse -Force -ErrorAction Stop
+        }
+        if (Test-Path -LiteralPath $WorktreePath) {
+            Write-Host '  WORKTREE CLEANUP ERROR: target still exists after delete' -ForegroundColor Red
+            return $false
+        }
+    } catch {
+        Write-Host "  WORKTREE CLEANUP ERROR: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+    return $true
+}
+
+function New-CiWorktree {
+    param(
+        [string]$ProjectPath,
+        [string]$WorktreePath
+    )
+    try {
+        $parent = Split-Path -Parent $WorktreePath
+        if ($parent -and -not (Test-Path -LiteralPath $parent -PathType Container)) {
+            New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        }
+        if (Test-Path -LiteralPath $WorktreePath) {
+            $items = @(Get-ChildItem -LiteralPath $WorktreePath -Force -ErrorAction Stop)
+            if ($items.Count -gt 0) {
+                return [pscustomobject]@{ Success = $false; Output = 'target directory is not empty' }
+            }
+        }
+    } catch {
+        return [pscustomobject]@{ Success = $false; Output = "filesystem error: $($_.Exception.Message)" }
+    }
+    $r = Invoke-Git $ProjectPath @('worktree','add','--detach',$WorktreePath,'HEAD')
+    $ok = ($r.ExitCode -eq 0) -and
+          (Test-GitWorktreeRegistered $ProjectPath $WorktreePath) -and
+          (Test-CiWorktreeUsable $WorktreePath)
+    return [pscustomobject]@{ Success = $ok; Output = $r.Output }
+}
+
+function Ensure-CiWorktree {
+    param(
+        [string]$CiRoot,
+        [string]$ProjectName,
+        [string]$ProjectPath,
+        [string]$WorktreePath
+    )
+    if (-not (Test-CiOwnedWorktreePath $CiRoot $ProjectName $ProjectPath $WorktreePath)) {
+        Write-Host "  WORKTREE FAIL - unsafe target: $WorktreePath" -ForegroundColor Red
+        return $false
+    }
+    if (-not (Test-CiWorktreeUsable $ProjectPath)) {
+        Write-Host '  WORKTREE FAIL - source repo unusable' -ForegroundColor Red
+        return $false
+    }
+
+    $exists = Test-Path -LiteralPath $WorktreePath -PathType Container
+    $registered = Test-GitWorktreeRegistered $ProjectPath $WorktreePath
+    $usable = Test-CiWorktreeUsable $WorktreePath
+    if ($exists -and $registered -and $usable) {
+        Write-Host '  WORKTREE REUSE' -ForegroundColor Green
+        return $true
+    }
+
+    if ($exists) {
+        $repair = Repair-CiWorktree $ProjectPath $WorktreePath
+        if ($repair.Success) {
+            Write-Host '  WORKTREE REPAIR SUCCESS' -ForegroundColor Green
+            return $true
+        }
+        if ($repair.Output) { Write-Host "  WORKTREE REPAIR ERROR: $($repair.Output)" -ForegroundColor DarkYellow }
+        Write-Host '  WORKTREE RECREATE' -ForegroundColor Yellow
+        if (-not (Remove-StaleCiWorktree $CiRoot $ProjectName $ProjectPath $WorktreePath)) { return $false }
+    } else {
+        try { Invoke-Git $ProjectPath @('worktree','prune') | Out-Null } catch {}
+    }
+
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $created = New-CiWorktree $ProjectPath $WorktreePath
+        if ($created.Success) {
+            Write-Host '  WORKTREE RECREATE SUCCESS' -ForegroundColor Green
+            return $true
+        }
+        if ($created.Output) { Write-Host "  WORKTREE CREATE ERROR: $($created.Output)" -ForegroundColor DarkYellow }
+        if ($attempt -eq 1) {
+            if (-not (Remove-StaleCiWorktree $CiRoot $ProjectName $ProjectPath $WorktreePath)) { return $false }
+        }
+    }
+    Write-Host '  WORKTREE FAIL' -ForegroundColor Red
+    return $false
+}
+
 # Uoc tinh thoi gian build tu cac lan THANH CONG truoc do cua dung
 # project + dung loai build. Dung trung vi de mot lan bat thuong
 # (may ban, build lan dau import lai tu dau) khong keo lech.
