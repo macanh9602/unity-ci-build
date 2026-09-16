@@ -101,6 +101,11 @@ function ConvertTo-CiConfigV3 {
     if (-not (Test-CiHasProp $Cfg 'pollSeconds')) {
         Add-Member -InputObject $Cfg -NotePropertyName pollSeconds -NotePropertyValue 5 -Force
     }
+    foreach ($name in @('autoProvisionUnity','autoShareCiRoot','autoCreateTask')) {
+        if (-not (Test-CiHasProp $Cfg $name)) {
+            Add-Member -InputObject $Cfg -NotePropertyName $name -NotePropertyValue $true -Force
+        }
+    }
     foreach ($p in $Cfg.projects) {
         if (-not (Test-CiHasProp $p 'gitRemote')) {
             Add-Member -InputObject $p -NotePropertyName gitRemote -NotePropertyValue '' -Force
@@ -122,6 +127,9 @@ function ConvertTo-CiConfigV2 {
         reserveCoresForEditor = $Cfg.reserveCoresForEditor
         buildTimeoutMinutes   = $Cfg.buildTimeoutMinutes
         useNographics         = $Cfg.useNographics
+        autoProvisionUnity    = $Cfg.autoProvisionUnity
+        autoShareCiRoot       = $Cfg.autoShareCiRoot
+        autoCreateTask        = $Cfg.autoCreateTask
         discord               = $Cfg.discord
         defaultProject        = $Cfg.projectName
         projects              = @(
@@ -198,6 +206,9 @@ function Get-EffectiveConfig {
         reserveCoresForEditor = $Cfg.reserveCoresForEditor
         buildTimeoutMinutes   = $Cfg.buildTimeoutMinutes
         useNographics         = $Cfg.useNographics
+        autoProvisionUnity    = $Cfg.autoProvisionUnity
+        autoShareCiRoot       = $Cfg.autoShareCiRoot
+        autoCreateTask        = $Cfg.autoCreateTask
         discord               = $Cfg.discord
     }
 }

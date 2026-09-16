@@ -13,7 +13,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position=0)]
-    [ValidateSet('build','cancel','status','queue','projects','branches','open','config','doctor','repair','drive','help')]
+    [ValidateSet('build','cancel','status','queue','projects','branches','open','config','doctor','agent-doctor','pair','import-secrets','repair','drive','help')]
     [string]$Command = 'help',
 
     [Parameter(Position=1)][string]$JobId = '',
@@ -32,6 +32,8 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib\Common.ps1')
 . (Join-Path $PSScriptRoot 'lib\Queue.ps1')
 . (Join-Path $PSScriptRoot 'lib\Drive.ps1')
+. (Join-Path $PSScriptRoot 'lib\Agent.ps1')
+. (Join-Path $PSScriptRoot 'lib\Unity.ps1')
 Set-ConsoleUtf8
 
 if (-not (Test-CiInstalled)) {
@@ -521,6 +523,87 @@ switch ($Command) {
     & (Join-Path $PSScriptRoot 'setup.ps1') -CheckOnly
 }
 
+'agent-doctor' {
+    if (-not (Test-CiIsAgent $root)) {
+        Write-Bad 'Lenh nay chi danh cho may build.'
+        exit 1
+    }
+    Write-Title 'Agent doctor'
+    $d = Test-CiAgentDoctor -CiRoot $root.ciRoot -ToolDir (Get-ToolDir) -AgentName $root.agentName
+    foreach ($c in $d.Checks) {
+        if ($c.Ok) { Write-Ok "$($c.Name): $($c.Message)" }
+        else { Write-Bad "$($c.Name): $($c.Message)" }
+    }
+    if ($d.Ready) { Write-Ok 'READY' } else { Write-Bad 'BLOCKED' }
+    exit $(if ($d.Ready) { 0 } else { 1 })
+}
+
+'pair' {
+    $hostName = if ($JobId) { $JobId } else { Read-Choice 'Hostname/IP may build' '' }
+    if (-not $hostName) { Write-Bad 'Thieu hostname/IP.'; exit 1 }
+    $pairPath = "\\$hostName\UnityCI\pairing\pairing.json"
+    $pair = Read-JsonFile $pairPath
+    if (-not $pair) { Write-Bad "Khong doc duoc $pairPath"; exit 1 }
+    if ($pair.expiresAt -and ([datetime]$pair.expiresAt) -lt (Get-Date)) { Write-Bad 'Pairing code da het han.'; exit 1 }
+    Write-Info "Agent: $($pair.agentName)  Share: $($pair.share)"
+    $code = Read-Choice 'Pairing code' ''
+    $normalized = ($code -replace '[^A-Za-z0-9]','').ToUpperInvariant()
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $codeHash = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($normalized))) -replace '-','').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+    if ($codeHash -ne "$($pair.pairCodeHash)".ToLowerInvariant()) { Write-Bad 'Pairing code khong dung.'; exit 1 }
+    $root.ciRoot = $pair.share
+    if (-not (Test-CiHasProp $root 'remoteAgents')) { Add-Member -InputObject $root -NotePropertyName remoteAgents -NotePropertyValue @() -Force }
+    $list = @($root.remoteAgents | Where-Object { "$($_.name)" -ne "$($pair.agentName)" })
+    $list += [pscustomobject]@{ name=$pair.agentName; ciRoot=$pair.share; canBuild=@($pair.platforms) }
+    $root.remoteAgents = $list
+    Write-CiConfig $root
+    Remove-Item -LiteralPath $pairPath -Force -ErrorAction SilentlyContinue
+    Write-Ok "Da pair agent $($pair.agentName): $($pair.share)"
+}
+
+'import-secrets' {
+    if ("$($root.role)" -ne 'agent') {
+        Write-Bad 'import-secrets chi duoc chay tren build agent de DPAPI bind dung may/user.'
+        exit 1
+    }
+    $bundlePath = if ($JobId) { $JobId } else { Read-Choice 'Duong dan secret bundle JSON' '' }
+    if (-not $bundlePath -or -not (Test-Path -LiteralPath $bundlePath -PathType Leaf)) {
+        Write-Bad 'Khong tim thay secret bundle.'; exit 1
+    }
+    $bundle = Read-JsonFile $bundlePath
+    if (-not $bundle.project -or -not $bundle.keystorePath -or -not (Test-Path -LiteralPath $bundle.keystorePath)) {
+        Write-Bad 'Bundle can project va keystorePath hop le.'; exit 1
+    }
+    if (-not $bundle.keystorePass -or -not $bundle.keyaliasPass -or -not $bundle.keyaliasName) {
+        Write-Bad 'Bundle thieu keyaliasName/keystorePass/keyaliasPass.'; exit 1
+    }
+    $project = Get-CiProject $root "$($bundle.project)"
+    if (-not $project) { Write-Bad "Khong co project '$($bundle.project)' trong config."; exit 1 }
+    # Keep keystore outside the SMB root, whose share ACL allows build clients to modify files.
+    $secureBase = Join-CiPath (Split-Path -Parent $root.ciRoot) 'UnityCISecure'
+    $secureDir = Join-CiPath $secureBase $project.name
+    if (-not (Test-Path $secureDir)) { New-Item -ItemType Directory -Force -Path $secureDir | Out-Null }
+    $secureAcl = Ensure-CiSecureAcl $secureDir
+    if (-not $secureAcl.Success) { Write-Bad "Secure ACL failed: $($secureAcl.Message)"; exit 1 }
+    $keystore = Join-CiPath $secureDir 'release.keystore'
+    Copy-Item -LiteralPath $bundle.keystorePath -Destination $keystore -Force
+    $oldSecrets = Read-CiSecrets
+    $projectSecrets = if ($oldSecrets.projects) { $oldSecrets.projects } else { [pscustomobject]@{} }
+    $bag = @{}
+    foreach ($p in $projectSecrets.PSObject.Properties) { $bag[$p.Name] = $p.Value }
+    $bag[$project.name] = [pscustomobject]@{
+        keystorePass = Protect-CiString "$($bundle.keystorePass)"
+        keyaliasPass  = Protect-CiString "$($bundle.keyaliasPass)"
+    }
+    Write-JsonFile (Get-SecretsPath) ([pscustomobject]@{ discordWebhook=$oldSecrets.discordWebhook; projects=[pscustomobject]$bag })
+    $project.android.keystorePath = $keystore
+    $project.android.keyaliasName = "$($bundle.keyaliasName)"
+    Write-CiConfig $root
+    Write-Ok "Da luu keystore an toan tai $keystore"
+    if (Read-YesNo 'Xoa bundle plaintext?' $false) { Remove-Item -LiteralPath $bundlePath -Force }
+}
+
 default {
     Write-Title 'Unity CI Build'
     Write-Host @'
@@ -540,6 +623,9 @@ default {
   .\ci.ps1 open                         mo thu muc chua file build
   .\ci.ps1 config                       xem / doi duong dan, khong can cai lai
   .\ci.ps1 doctor                       kiem tra lai he thong
+  .\ci.ps1 agent-doctor                kiem tra build agent
+  .\ci.ps1 pair BUILD-PC-01            pair voi may build
+  .\ci.ps1 import-secrets <bundle.json> nhap keystore release
   .\ci.ps1 repair                       tao lai worktree con thieu
   .\ci.ps1 drive                        chan va sua ket noi Google Drive
 
