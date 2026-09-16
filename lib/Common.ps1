@@ -106,6 +106,9 @@ function ConvertTo-CiConfigV3 {
             Add-Member -InputObject $Cfg -NotePropertyName $name -NotePropertyValue $true -Force
         }
     }
+    if (-not (Test-CiHasProp $Cfg 'allowedGitRemotePrefixes')) {
+        Add-Member -InputObject $Cfg -NotePropertyName allowedGitRemotePrefixes -NotePropertyValue @() -Force
+    }
     foreach ($p in $Cfg.projects) {
         if (-not (Test-CiHasProp $p 'gitRemote')) {
             Add-Member -InputObject $p -NotePropertyName gitRemote -NotePropertyValue '' -Force
@@ -130,6 +133,7 @@ function ConvertTo-CiConfigV2 {
         autoProvisionUnity    = $Cfg.autoProvisionUnity
         autoShareCiRoot       = $Cfg.autoShareCiRoot
         autoCreateTask        = $Cfg.autoCreateTask
+        allowedGitRemotePrefixes = $Cfg.allowedGitRemotePrefixes
         discord               = $Cfg.discord
         defaultProject        = $Cfg.projectName
         projects              = @(
@@ -209,6 +213,7 @@ function Get-EffectiveConfig {
         autoProvisionUnity    = $Cfg.autoProvisionUnity
         autoShareCiRoot       = $Cfg.autoShareCiRoot
         autoCreateTask        = $Cfg.autoCreateTask
+        allowedGitRemotePrefixes = $Cfg.allowedGitRemotePrefixes
         discord               = $Cfg.discord
     }
 }

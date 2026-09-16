@@ -17,6 +17,13 @@ if (-not (Test-AgentAdmin)) {
 
 Write-Title 'Unity CI Build Agent Bootstrap'
 
+function Get-TrustedGitPrefix {
+    param([string]$Remote)
+    $value = "$Remote".Trim().TrimEnd('/')
+    if ($value -match '^(.*\/)[^\/]+$') { return $Matches[1] }
+    return ''
+}
+
 $git=Get-Command git.exe -ErrorAction SilentlyContinue
 if (-not $git) {
     $winget=Get-Command winget.exe -ErrorAction SilentlyContinue
@@ -54,6 +61,9 @@ if ($unityCli.Available) {
         if ($auth.Authenticated) { Write-Ok 'UNITY AUTH READY' }
         else { Write-Miss "AUTH REQUIRED: $($login.Output)" }
     } else { Write-Ok 'UNITY AUTH READY' }
+    $license = Get-UnityLicenseStatus $cliBackend
+    if ($license.Ready) { Write-Ok 'UNITY LICENSE READY' }
+    else { Write-Miss "$($license.Message) - login/activate the license once, then rerun install-agent.bat" }
 }
 
 $oldConfig=Read-JsonFile (Get-ConfigPath)
@@ -70,6 +80,7 @@ $config=[pscustomobject]@{
     buildTimeoutMinutes=$(if ($oldConfig -and $oldConfig.buildTimeoutMinutes) { $oldConfig.buildTimeoutMinutes } else { 90 })
     useNographics=$(if ($oldConfig -and $oldConfig.useNographics -ne $null) { $oldConfig.useNographics } else { $false })
     autoProvisionUnity=$true; autoShareCiRoot=$true; autoCreateTask=$true
+    allowedGitRemotePrefixes=$(if ($oldConfig -and $oldConfig.allowedGitRemotePrefixes) { @($oldConfig.allowedGitRemotePrefixes) } else { @($oldConfig.projects | Where-Object { $_.gitRemote } | ForEach-Object { Get-TrustedGitPrefix $_.gitRemote } | Where-Object { $_ }) })
     discord=$(if ($oldConfig -and $oldConfig.discord) { $oldConfig.discord } else { [pscustomobject]@{enabled=$false} })
     projects=$(if ($oldConfig -and $oldConfig.projects) { @($oldConfig.projects) } else { @() })
     remoteAgents=$(if ($oldConfig -and $oldConfig.remoteAgents) { @($oldConfig.remoteAgents) } else { @() })
@@ -77,6 +88,9 @@ $config=[pscustomobject]@{
 $agentName = "$($config.agentName)"
 Write-CiConfig $config
 Write-Ok "CI ROOT READY: $ciRoot"
+if (@($config.allowedGitRemotePrefixes).Count -eq 0) {
+    Write-Miss 'BLOCKED FOR UNKNOWN PROJECTS - configure allowedGitRemotePrefixes in config.json'
+}
 
 $acl=Ensure-CiRootAcl $ciRoot; if ($acl.Success) { Write-Ok $acl.Message } else { Write-Miss "ACL: $($acl.Message)" }
 $fw=Ensure-CiSmbFirewall; if ($fw.Success) { Write-Ok $fw.Message } else { Write-Miss "Firewall: $($fw.Message)" }

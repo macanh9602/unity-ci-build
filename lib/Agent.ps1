@@ -167,9 +167,16 @@ function Test-CiAgentDoctor {
     if ($backendOk) {
         $auth = Get-UnityAuthStatus $backend
         & $add 'Unity authentication' $auth.Authenticated $auth.Message
+        $license = Get-UnityLicenseStatus $backend
+        & $add 'Unity license' $license.Ready $license.Message
     } else {
         & $add 'Unity authentication' $false 'AUTH REQUIRED - install Unity CLI or login/configure Unity Hub'
+        & $add 'Unity license' $false 'UNITY LICENSE REQUIRED - Unity CLI license status unavailable'
     }
+    $agentConfig = $null
+    try { $agentConfig = Read-CiConfig } catch {}
+    $trustedPrefixes = if ($agentConfig -and (Test-CiHasProp $agentConfig 'allowedGitRemotePrefixes')) { @($agentConfig.allowedGitRemotePrefixes | Where-Object { "$_".Trim() }) } else { @() }
+    & $add 'Unknown project trust' ($trustedPrefixes.Count -gt 0) $(if ($trustedPrefixes.Count -gt 0) { "$($trustedPrefixes.Count) trusted Git prefix(es)" } else { 'BLOCKED FOR UNKNOWN PROJECTS - configure allowedGitRemotePrefixes' })
     $heartbeat = @(Get-ChildItem -LiteralPath (Join-CiPath $CiRoot 'agents') -Filter '*.json' -ErrorAction SilentlyContinue |
                    Where-Object { $_.LastWriteTime -gt (Get-Date).AddSeconds(-20) } |
                    ForEach-Object { Read-JsonFile $_.FullName } |

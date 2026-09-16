@@ -8,6 +8,8 @@
     "reserveCoresForEditor": 4,
     "buildTimeoutMinutes": 90,
     "useNographics": false,
+    "allowedGitRemotePrefixes": [],
+    "_allowedGitRemotePrefixes": "Literal trusted prefixes for unknown project remotes, for example git@github.com:MyStudio/",
 
     "discord": { "enabled": true },
     "_discord": "URL webhook nam trong secrets.json, khong nam o day.",

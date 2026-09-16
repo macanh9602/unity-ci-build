@@ -27,15 +27,28 @@ if ($root.discord -and $root.discord.enabled) { $webhook = Get-Secret $secrets '
 
 $env:UNITY_NO_CONSENT_PROMPT = '1'
 
+function Normalize-CiGitRemote {
+    param([string]$Remote)
+    return ("$Remote".Trim() -replace '/+$','')
+}
+
 function Test-CiGitRemoteAllowed {
     param($Root, [string]$ProjectName, [string]$Remote)
-    $value = "$Remote".Trim()
+    $value = Normalize-CiGitRemote $Remote
     if (-not $value -or $value -match '[;&|<>]' -or $value -match '\s' -or $value.StartsWith('-')) { return $false }
     if ($value -notmatch '(?i)^(https?|ssh)://[^/\s]+/.+|^git@[^:\s]+:.+') { return $false }
     $known = @($Root.projects | Where-Object { "$($_.name)" -eq $ProjectName } | Select-Object -First 1)
     if ($known -and "$($known[0].gitRemote)" -and
-        -not [string]::Equals("$($known[0].gitRemote)".Trim(), $value, [StringComparison]::OrdinalIgnoreCase)) { return $false }
-    return $true
+        -not [string]::Equals((Normalize-CiGitRemote "$($known[0].gitRemote)"), $value, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if ($known) { return $true }
+    $prefixes = @()
+    if (Test-CiHasProp $Root 'allowedGitRemotePrefixes') { $prefixes = @($Root.allowedGitRemotePrefixes) }
+    foreach ($prefix in $prefixes) {
+        $safePrefix = "$prefix".Trim()
+        if ($safePrefix -and ($safePrefix.EndsWith('/') -or $safePrefix.EndsWith(':')) -and
+            $value.StartsWith($safePrefix, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
 }
 
 # ------------------------------------------------------------
@@ -79,7 +92,7 @@ function Sync-Worktree {
             Remove-Item -LiteralPath $wt -Recurse -Force -ErrorAction Stop
         }
         if (-not (Test-CiGitRemoteAllowed $root $Config.projectName $remote)) {
-            throw "gitRemote khong duoc phep cho project '$($Config.projectName)': $remote"
+            throw "REMOTE_NOT_TRUSTED | gitRemote khong duoc phep cho project '$($Config.projectName)': $remote"
         }
         $cloneOutput = ''
         for ($attempt = 1; $attempt -le 2; $attempt++) {
@@ -369,18 +382,14 @@ function Invoke-UnityBuild {
 
 # ------------------------------------------------------------
 function Invoke-CiJob {
-    param($Config, $Job, $Secrets, [string]$Webhook)
+    param($Config, $Job, $Secrets, [string]$Webhook, [string]$JobFile, [switch]$WorktreeSynced)
 
     $paths   = Get-CiPaths $Config
     Initialize-CiDirs $Config
     $started = Get-Date
     $logPath = Join-CiPath $paths.Logs   ("{0}.log"        -f $Job.id)
     $errPath = Join-CiPath $paths.Logs   ("{0}.errors.txt" -f $Job.id)
-    $jobFile = Move-CiJobToProcessing -Config $Config -Job $Job -AgentName "$($Config.agentName)"
-    if (-not $jobFile) {
-        Write-RunnerLog $Config "BO QUA $($Job.id): agent khac da nhan truoc"
-        return $false
-    }
+    if (-not $JobFile) { throw "PREPARATION_FAILURE | missing processing job file" }
 
     Write-RunnerLog $Config "BAT DAU $($Job.id)  [$($Config.projectName)]  $($Job.branch)@$($Job.shaShort)  $($Job.format)/$($Job.config)"
 
@@ -399,8 +408,7 @@ function Invoke-CiJob {
             $cancelled = $true
             throw 'Da huy truoc khi build bat dau'
         }
-        Ensure-ProjectBuildCredentials -Config $Config -Job $Job -Secrets $Secrets | Out-Null
-        Sync-Worktree -Config $Config -Sha $Job.sha -GitRemote "$($Job.gitRemote)"
+        if (-not $WorktreeSynced) { Sync-Worktree -Config $Config -Sha $Job.sha -GitRemote "$($Job.gitRemote)" }
         $cacheState = Sync-CiUnityCache -Config $Config
         Copy-CiScript  -Config $Config
 
@@ -527,9 +535,11 @@ function Register-CiProjectFromJob {
     $wt     = Join-CiPath $Root.ciRoot 'worktree' $name
     $builds = Join-CiPath $Root.ciRoot 'builds'   $name
     $remote = "$($Job.gitRemote)"
+    $knownProject = @($Root.projects | Where-Object { "$($_.name)" -eq $name } | Select-Object -First 1)
+    if (-not $remote -and $knownProject) { $remote = "$($knownProject[0].gitRemote)" }
 
     if (-not (Test-CiGitRemoteAllowed $Root $name $remote)) {
-        throw "gitRemote khong duoc phep cho project '$name': $remote"
+        throw "REMOTE_NOT_TRUSTED | gitRemote khong duoc phep cho project '$name': $remote"
     }
 
     if (-not (Test-CiWorktreeUsable $wt)) {
@@ -544,18 +554,15 @@ function Register-CiProjectFromJob {
         $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
         $cloneOutput = ''
         try { $cloneOutput = ((& git clone --quiet $remote $wt 2>&1) | ForEach-Object { "$_" }) -join "`n" } finally { $ErrorActionPreference = $old }
-        if (-not (Test-CiWorktreeUsable $wt)) { throw "Clone that bai tu: $remote`n$cloneOutput" }
+        if (-not (Test-CiWorktreeUsable $wt)) { throw "GIT_FAILURE | Clone that bai tu: $remote`n$cloneOutput" }
     }
 
-    $r = Invoke-Git $wt @('fetch','--all','--prune','--quiet')
-    if ($r.ExitCode -ne 0) { throw "Fetch that bai cho project '$name':`n$($r.Output)" }
-    $r = Invoke-Git $wt @('checkout','--detach','--force',"$($Job.sha)")
-    if ($r.ExitCode -ne 0) { throw "Checkout that bai cho project '$name':`n$($r.Output)" }
-    $r = Invoke-Git $wt @('reset','--hard',"$($Job.sha)")
-    if ($r.ExitCode -ne 0) { throw "Reset that bai cho project '$name':`n$($r.Output)" }
+    $syncConfig = [pscustomobject]@{ ciRoot=$Root.ciRoot; projectName=$name; projectPath=''; worktreePath=$wt; gitRemote=$remote }
+    try { Sync-Worktree -Config $syncConfig -Sha "$($Job.sha)" -GitRemote $remote }
+    catch { throw "GIT_FAILURE | $($_.Exception.Message)" }
 
-    $ver = Get-CiUnityVersionAtCommit -WorktreePath $wt -Sha "$($Job.sha)"
-    if (-not $ver) { $ver = "$($Job.unityVersion)" }
+    try { $ver = Get-CiUnityVersionAtCommit -WorktreePath $wt -Sha "$($Job.sha)" }
+    catch { throw "PREFLIGHT_FAILURE | $($_.Exception.Message)" }
     $autoProvision = $true
     if (Test-CiHasProp $Root 'autoProvisionUnity') { $autoProvision = [bool]$Root.autoProvisionUnity }
     $provision = Ensure-UnityEditor -Version $ver -NeedAndroid $true -AutoInstall $autoProvision
@@ -595,13 +602,37 @@ function Get-CiUnityVersionAtCommit {
     throw "Target commit $Sha khong co m_EditorVersion trong ProjectVersion.txt"
 }
 
+function Assert-CiJobCredentials {
+    param($Root, $Job, $Secrets)
+    if ("$($Job.config)" -ne 'release') { return }
+    $p = @($Root.projects | Where-Object { "$($_.name)" -eq "$($Job.project)" } | Select-Object -First 1)
+    if (-not $p) { throw "CREDENTIALS_REQUIRED | release project '$($Job.project)' is not configured on this agent" }
+    try { Ensure-ProjectBuildCredentials -Config (Get-EffectiveConfig $Root "$($Job.project)") -Job $Job -Secrets $Secrets | Out-Null }
+    catch { throw "CREDENTIALS_REQUIRED | $($_.Exception.Message)" }
+}
+
+function Write-CiPreflightFailureResult {
+    param($Root, $Job, [string]$Message)
+    $stage = 'preflight'
+    if ($Message -match '^REMOTE_NOT_TRUSTED|^GIT_FAILURE') { $stage = 'git' }
+    elseif ($Message -match '^PROVISIONING_FAILED') { $stage = 'provisioning' }
+    elseif ($Message -match '^CREDENTIALS_REQUIRED') { $stage = 'credentials' }
+    Write-JsonFile (Join-CiPath $Root.ciRoot 'results' ("{0}.json" -f $Job.id)) ([pscustomobject]@{
+        id=$Job.id; project=$Job.project; success=$false; cancelled=$false; branch=$Job.branch
+        sha=$Job.sha; shaShort=$Job.shaShort; format=$Job.format; config=$Job.config
+        failureStage=$stage; failReason=$Message; finishedAt=(Get-Date).ToString('o')
+    })
+}
+
 function Resolve-CiJobConfig {
     param($Root, $Job)
     $p = $Root.projects | Where-Object { $_.name -eq "$($Job.project)" } | Select-Object -First 1
     if ($p -and (Test-CiWorktreeUsable $p.worktreePath)) {
         $cfg = Get-EffectiveConfig $Root "$($Job.project)"
-        Sync-Worktree -Config $cfg -Sha "$($Job.sha)" -GitRemote "$($Job.gitRemote)"
-        $ver = Get-CiUnityVersionAtCommit -WorktreePath $cfg.worktreePath -Sha "$($Job.sha)"
+        try { Sync-Worktree -Config $cfg -Sha "$($Job.sha)" -GitRemote "$($Job.gitRemote)" }
+        catch { throw "GIT_FAILURE | $($_.Exception.Message)" }
+        try { $ver = Get-CiUnityVersionAtCommit -WorktreePath $cfg.worktreePath -Sha "$($Job.sha)" }
+        catch { throw "PREFLIGHT_FAILURE | $($_.Exception.Message)" }
         $autoProvision = if (Test-CiHasProp $Root 'autoProvisionUnity') { [bool]$Root.autoProvisionUnity } else { $true }
         $provision = Ensure-UnityEditor -Version $ver -NeedAndroid $true -AutoInstall $autoProvision
         if (-not $provision.Success) { throw "PROVISIONING_FAILED | Required Unity: $ver | Stage: $($provision.Stage) | Reason: $($provision.Reason)" }
@@ -668,18 +699,20 @@ try {
             continue
         }
 
+        $jobFile = Move-CiJobToProcessing -Config $root -Job $job -AgentName "$($root.agentName)"
+        if (-not $jobFile) { continue }
+        $job | Add-Member -NotePropertyName _file -NotePropertyValue $jobFile -Force
+        Write-CiHeartbeat $root 'preparing' $job.id
         try {
+            $secrets = Read-CiSecrets
+            Assert-CiJobCredentials -Root $root -Job $job -Secrets $secrets
+            if (Test-CiCancelRequested $root $job.id) { throw 'PREPARATION_FAILURE | job cancelled before preparation' }
             $jobCfg = Resolve-CiJobConfig $root $job
+            if (Test-CiCancelRequested $root $job.id) { throw 'PREPARATION_FAILURE | job cancelled during preparation' }
         } catch {
             $message = $_.Exception.Message
             Write-RunnerLog $root "BO QUA $($job.id): $message"
-            if ($message -match '^PROVISIONING_FAILED') {
-                Write-JsonFile (Join-CiPath $root.ciRoot 'results' ("{0}.json" -f $job.id)) ([pscustomobject]@{
-                    id=$job.id; project=$job.project; success=$false; cancelled=$false; branch=$job.branch
-                    sha=$job.sha; shaShort=$job.shaShort; format=$job.format; config=$job.config
-                    failureStage='provisioning'; failReason=$message; finishedAt=(Get-Date).ToString('o')
-                })
-            }
+            Write-CiPreflightFailureResult -Root $root -Job $job -Message $message
             # day sang failed/ de khong lap vo han tren cung mot job hong
             try {
                 $failDir = Join-CiPath $root.ciRoot 'failed'
@@ -690,9 +723,7 @@ try {
         }
 
         Write-CiHeartbeat $root 'building' $job.id
-        # Reload local DPAPI secrets so import-secrets is picked up without restarting agent.
-        $secrets = Read-CiSecrets
-        Invoke-CiJob -Config $jobCfg -Job $job -Secrets $secrets -Webhook $webhook | Out-Null
+        Invoke-CiJob -Config $jobCfg -Job $job -Secrets $secrets -Webhook $webhook -JobFile $jobFile -WorktreeSynced | Out-Null
         Write-CiHeartbeat $root 'idle'
 
         if ($Once) { break }

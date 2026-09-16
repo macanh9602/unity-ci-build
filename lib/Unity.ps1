@@ -68,6 +68,19 @@ function Get-UnityAuthStatus {
     return [pscustomobject]@{ Known=$false; Authenticated=$false; ExitCode=-1; Output=''; Message='AUTH REQUIRED - login in Unity Hub before first provision' }
 }
 
+function Get-UnityLicenseStatus {
+    param($Backend)
+    if (-not $Backend -or $Backend.Name -ne 'unity-cli') {
+        return [pscustomobject]@{ Known=$false; Ready=$false; ExitCode=-1; Output=''; Message='UNITY LICENSE REQUIRED - Unity CLI license status unavailable' }
+    }
+    $r = Invoke-UnityProvisionCommand -FilePath $Backend.Path -Arguments @('license','status') -TimeoutMinutes 1
+    $notReady = $r.Output -match '(?i)no active license|not activated|license required|no license|unlicensed|inactive'
+    if ($r.ExitCode -eq 0 -and -not $notReady) {
+        return [pscustomobject]@{ Known=$true; Ready=$true; ExitCode=$r.ExitCode; Output=$r.Output; Message='Unity license OK' }
+    }
+    return [pscustomobject]@{ Known=$true; Ready=$false; ExitCode=$r.ExitCode; Output=$r.Output; Message='UNITY LICENSE REQUIRED' }
+}
+
 function Invoke-UnityAuthLogin {
     param($Backend)
     if (-not $Backend -or $Backend.Name -ne 'unity-cli') {
