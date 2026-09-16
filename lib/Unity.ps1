@@ -111,8 +111,16 @@ function Get-UnityEditors {
         foreach ($d in (Get-ChildItem -Path $r -Directory -ErrorAction SilentlyContinue)) {
             $exe = Join-Path $d.FullName 'Editor\Unity.exe'
             if (Test-Path $exe) {
+                $version = $d.Name
+                $architecture = ''
+                if ($d.Name -match '^(?<version>.+)-(?<architecture>x86_64|arm64)$') {
+                    $version = $Matches.version
+                    $architecture = $Matches.architecture
+                }
                 [void]$found.Add([pscustomobject]@{
-                    Version = $d.Name
+                    Version = $version
+                    InstallFolder = $d.Name
+                    Architecture = $architecture
                     Exe     = $exe
                     Root    = $d.FullName
                 })
@@ -122,13 +130,117 @@ function Get-UnityEditors {
     return $found.ToArray()
 }
 
+function Get-UnityEditorPrefValue {
+    param([string[]]$Names)
+    $registryPaths = @(
+        'Software\Unity Technologies\Unity Editor 5.x',
+        'Software\Unity Technologies\Unity Editor 6.x',
+        'Software\Unity Technologies\Unity Editor'
+    )
+    foreach ($path in $registryPaths) {
+        $key = $null
+        try {
+            $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($path, $false)
+            if (-not $key) { continue }
+            $valueNames = @()
+            try { $valueNames = @($key.GetValueNames()) } catch { continue }
+            foreach ($name in $Names) {
+                $matches = @($valueNames | Where-Object { $_ -eq $name -or $_ -like "${name}_*" })
+                foreach ($valueName in $matches) {
+                    try {
+                        $value = $key.GetValue($valueName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                        if ($value -and (Test-Path -LiteralPath "$value")) { return "$value" }
+                    } catch { continue }
+                }
+            }
+        } catch { continue }
+        finally { if ($key) { $key.Dispose() } }
+    }
+    return ''
+}
+
+function Get-BestUnityEditor {
+    param([string]$Version)
+    $candidates = @(Get-UnityEditors | Where-Object { $_.Version -eq $Version })
+    $ranked = foreach ($candidate in $candidates) {
+        $toolchain = Get-AndroidModuleState $candidate.Root
+        [pscustomobject]@{
+            Candidate = $candidate
+            Toolchain = $toolchain
+            UnityExeReady = [bool](Test-Path -LiteralPath $candidate.Exe)
+            ToolchainReady = [bool]$toolchain.BuildToolchainReady
+            HubManaged = [bool]($candidate.Root -match '(?i)[\\/]Unity[\\/]Hub[\\/]Editor[\\/]')
+        }
+    }
+    return ($ranked | Sort-Object @{Expression='ToolchainReady';Descending=$true}, @{Expression='UnityExeReady';Descending=$true}, @{Expression='HubManaged';Descending=$true}, @{Expression={ if ($_.Candidate.Architecture -eq 'x86_64') { 1 } else { 0 } };Descending=$true} | Select-Object -First 1)
+}
+
+function Get-UnityEditorResolution {
+    param([string]$Version)
+    $matches = foreach ($match in @(Get-UnityEditors | Where-Object { $_.Version -eq $Version })) {
+        [pscustomobject]@{ Installation=$match; Toolchain=(Get-AndroidModuleState $match.Root) }
+    }
+    $chosen = Get-BestUnityEditor $Version
+    [pscustomobject]@{ Version=$Version; Matches=$matches; Chosen=$chosen }
+}
+
+function Format-UnityEditorResolution {
+    param([string]$Version)
+    $resolution = Get-UnityEditorResolution $Version
+    $all = if (@($resolution.Matches).Count -eq 0) { 'none' } else {
+        (@($resolution.Matches) | ForEach-Object {
+            $i = $_.Installation; $t = $_.Toolchain
+            "{0} (Unity.exe=True, BuildToolchainReady={1})" -f $i.Root, $t.BuildToolchainReady
+        }) -join '; '
+    }
+    $chosen = if ($resolution.Chosen) { $resolution.Chosen.Candidate.Root } else { 'none' }
+    return "required=$Version; matches=$all; chosen=$chosen"
+}
+
+function Get-AndroidExternalToolchain {
+    $sdk = ''; $ndk = ''; $jdk = ''
+    try { $sdk = if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } elseif ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { Get-UnityEditorPrefValue @('AndroidSdkRoot','sdkRoot') } } catch { $sdk = '' }
+    try { $ndk = if ($env:ANDROID_NDK_ROOT) { $env:ANDROID_NDK_ROOT } else { Get-UnityEditorPrefValue @('AndroidNdkRoot','ndkRoot') } } catch { $ndk = '' }
+    try { $jdk = if ($env:JAVA_HOME) { $env:JAVA_HOME } else { Get-UnityEditorPrefValue @('JdkRoot','jdkRoot','JdkPath') } } catch { $jdk = '' }
+    $sdkOk = $false; $ndkOk = $false; $jdkOk = $false
+    try { $sdkOk = $sdk -and (Test-Path (Join-Path $sdk 'platform-tools\adb.exe')) -and (Test-Path (Join-Path $sdk 'platforms')) } catch { $sdkOk = $false }
+    try { $ndkOk = $ndk -and (Test-Path (Join-Path $ndk 'source.properties')) } catch { $ndkOk = $false }
+    try { $jdkOk = $jdk -and (Test-Path (Join-Path $jdk 'bin\java.exe')) } catch { $jdkOk = $false }
+    [pscustomobject]@{ Sdk=$sdkOk; Ndk=$ndkOk; Jdk=$jdkOk; SdkPath="$sdk"; NdkPath="$ndk"; JdkPath="$jdk" }
+}
+
 function Get-AndroidModuleState([string]$EditorRoot) {
     $ap = Join-Path $EditorRoot 'Editor\Data\PlaybackEngines\AndroidPlayer'
+    $embeddedSdk = Test-Path (Join-Path $ap 'SDK')
+    $embeddedNdk = Test-Path (Join-Path $ap 'NDK')
+    $embeddedJdk = Test-Path (Join-Path $ap 'OpenJDK')
+    $external = Get-AndroidExternalToolchain
+    $embeddedReady = $embeddedSdk -and $embeddedNdk -and $embeddedJdk
+    $externalReady = $external.Sdk -and $external.Ndk -and $external.Jdk
+    $ready = (Test-Path $ap) -and ($embeddedReady -or $externalReady)
+    $sdkPath = if ($external.SdkPath) { $external.SdkPath } else { 'missing' }
+    $ndkPath = if ($external.NdkPath) { $external.NdkPath } else { 'missing' }
+    $jdkPath = if ($external.JdkPath) { $external.JdkPath } else { 'missing' }
+    $status = "Embedded: SDK=$embeddedSdk NDK=$embeddedNdk JDK=$embeddedJdk; External: SDK=$sdkPath NDK=$ndkPath JDK=$jdkPath; BuildToolchainReady=$ready"
+    $reason = if ($embeddedReady) { "Android module: installed; $status" }
+              elseif ($externalReady) { "Android module: installed; $status; reuse existing external toolchain" }
+              elseif (-not (Test-Path $ap)) { "Android module: missing; $status; no usable Android toolchain" }
+              else { "Android module: installed; $status; no usable Android toolchain" }
     [pscustomobject]@{
-        Installed = Test-Path $ap
-        Jdk       = Test-Path (Join-Path $ap 'OpenJDK')
-        Sdk       = Test-Path (Join-Path $ap 'SDK')
-        Ndk       = Test-Path (Join-Path $ap 'NDK')
+        AndroidModuleInstalled = Test-Path $ap
+        EmbeddedSdkReady = $embeddedSdk
+        EmbeddedNdkReady = $embeddedNdk
+        EmbeddedJdkReady = $embeddedJdk
+        ExternalSdkReady = $external.Sdk
+        ExternalNdkReady = $external.Ndk
+        ExternalJdkReady = $external.Jdk
+        BuildToolchainReady = $ready
+        Reason = $reason
+        ExternalSdkPath = $external.SdkPath
+        ExternalNdkPath = $external.NdkPath
+        ExternalJdkPath = $external.JdkPath
+        # Compatibility aliases for existing callers.
+        Installed = Test-Path $ap; Sdk = $embeddedSdk; Ndk = $embeddedNdk; Jdk = $embeddedJdk
     }
 }
 
@@ -149,18 +261,19 @@ function Test-UnityProject([string]$P) {
 function Resolve-UnityExe {
     param([string]$Version)
     if (-not $Version) { return '' }
-    $e = @(Get-UnityEditors) | Where-Object { $_.Version -eq $Version } | Select-Object -First 1
-    if ($e) { return $e.Exe }
+    $e = Get-BestUnityEditor $Version
+    if ($e) { return $e.Candidate.Exe }
     return ''
 }
 
 function Ensure-UnityEditor {
     param([string]$Version, [bool]$NeedAndroid = $true, [bool]$AutoInstall = $true, [int]$TimeoutMinutes = 120)
-    $existing = @(Get-UnityEditors) | Where-Object { $_.Version -eq $Version } | Select-Object -First 1
+    $existingChoice = Get-BestUnityEditor $Version
+    $existing = if ($existingChoice) { $existingChoice.Candidate } else { $null }
     if ($existing) {
-        $modules = Get-AndroidModuleState $existing.Root
-        if (-not $NeedAndroid -or ($modules.Installed -and $modules.Sdk -and $modules.Ndk -and $modules.Jdk)) {
-            return [pscustomobject]@{ Success=$true; Stage='hit'; Exe=$existing.Exe; Reason='' }
+        $modules = $existingChoice.Toolchain
+        if (-not $NeedAndroid -or $modules.BuildToolchainReady) {
+            return [pscustomobject]@{ Success=$true; Stage='hit'; Exe=$existing.Exe; Reason=$modules.Reason; RawOutput=''; Matches=@(Get-UnityEditors | Where-Object { $_.Version -eq $Version }); Chosen=$existing }
         }
     }
     if (-not $AutoInstall) { return [pscustomobject]@{ Success=$false; Stage='blocked'; Exe=''; Reason="Unity $Version chua san sang va autoProvisionUnity dang tat" } }
@@ -171,7 +284,8 @@ function Ensure-UnityEditor {
     $mutex = New-Object System.Threading.Mutex($false, $mutexName, [ref]$created)
     try {
         $mutex.WaitOne() | Out-Null
-        $existing = @(Get-UnityEditors) | Where-Object { $_.Version -eq $Version } | Select-Object -First 1
+        $existingChoice = Get-BestUnityEditor $Version
+        $existing = if ($existingChoice) { $existingChoice.Candidate } else { $null }
         if (-not $existing) {
             if ($backend.Name -eq 'unity-cli') {
                 $args = @('install',$Version,'-m','android','--cm','--non-interactive','--yes','--accept-eula')
@@ -180,22 +294,29 @@ function Ensure-UnityEditor {
                 $args = @('--','--headless','install','--version',$Version,'--module','android','--module','android-sdk-ndk-tools','--module','android-open-jdk')
                 $p = Invoke-UnityProvisionCommand -FilePath $backend.Path -Arguments $args -TimeoutMinutes $TimeoutMinutes
             }
-            if ($p.TimedOut) { return [pscustomobject]@{ Success=$false; Stage='provisioning'; Exe=''; Reason=$p.Output } }
-            if ($p.ExitCode -ne 0) { return [pscustomobject]@{ Success=$false; Stage='provisioning'; Exe=''; Reason="Backend $($backend.Name) exit $($p.ExitCode): $($p.Output)" } }
+            if ($p.TimedOut) { return [pscustomobject]@{ Success=$false; Stage='provisioning'; Exe=''; Reason='PROVISIONING_TIMEOUT'; RawOutput=$p.Output } }
+            if ($p.ExitCode -ne 0) {
+                $summary = if ($p.Output -match 'ECONNREFUSED') { 'PROVISIONING_NETWORK_FAILED | Unity CLI could not reach module service | Error: ECONNREFUSED' } else { "PROVISIONING_FAILED | Backend $($backend.Name) exit $($p.ExitCode)" }
+                return [pscustomobject]@{ Success=$false; Stage='provisioning'; Exe=''; Reason=$summary; RawOutput=$p.Output }
+            }
         } elseif ($existing) {
             $args = @('--','--headless','install-modules','--version',$Version,'--module','android','--module','android-sdk-ndk-tools','--module','android-open-jdk')
             if ($backend.Name -eq 'unity-cli') { $args = @('install-modules','-e',$Version,'-m','android','--cm','--non-interactive','--yes','--accept-eula') }
             $p = Invoke-UnityProvisionCommand -FilePath $backend.Path -Arguments $args -TimeoutMinutes $TimeoutMinutes
-            if ($p.TimedOut) { return [pscustomobject]@{ Success=$false; Stage='provisioning'; Exe=''; Reason=$p.Output } }
-            if ($p.ExitCode -ne 0) { return [pscustomobject]@{ Success=$false; Stage='provisioning'; Exe=''; Reason="Backend $($backend.Name) exit $($p.ExitCode): $($p.Output)" } }
+            if ($p.TimedOut) { return [pscustomobject]@{ Success=$false; Stage='provisioning'; Exe=''; Reason='PROVISIONING_TIMEOUT'; RawOutput=$p.Output } }
+            if ($p.ExitCode -ne 0) {
+                $summary = if ($p.Output -match 'ECONNREFUSED') { 'PROVISIONING_NETWORK_FAILED | Unity CLI could not reach module service | Error: ECONNREFUSED' } else { "PROVISIONING_FAILED | Backend $($backend.Name) exit $($p.ExitCode)" }
+                return [pscustomobject]@{ Success=$false; Stage='provisioning'; Exe=''; Reason=$summary; RawOutput=$p.Output }
+            }
         }
-    } catch { return [pscustomobject]@{ Success=$false; Stage='provisioning'; Exe=''; Reason=$_.Exception.Message } }
+    } catch { return [pscustomobject]@{ Success=$false; Stage='provisioning'; Exe=''; Reason=$_.Exception.Message; RawOutput=$_.Exception.ToString() } }
     finally { try { $mutex.ReleaseMutex() } catch {}; $mutex.Dispose() }
-    $existing = @(Get-UnityEditors) | Where-Object { $_.Version -eq $Version } | Select-Object -First 1
-    if (-not $existing) { return [pscustomobject]@{ Success=$false; Stage='provisioning'; Exe=''; Reason="Khong tim thay Unity $Version sau provisioning" } }
-    $modules = Get-AndroidModuleState $existing.Root
-    if ($NeedAndroid -and (-not ($modules.Installed -and $modules.Sdk -and $modules.Ndk -and $modules.Jdk))) {
-        return [pscustomobject]@{ Success=$false; Stage='provisioning'; Exe=''; Reason='Android Build Support/SDK/NDK/OpenJDK chua day du' }
+    $existingChoice = Get-BestUnityEditor $Version
+    $existing = if ($existingChoice) { $existingChoice.Candidate } else { $null }
+    if (-not $existing) { return [pscustomobject]@{ Success=$false; Stage='provisioning'; Exe=''; Reason="Khong tim thay Unity $Version sau provisioning"; RawOutput='' } }
+    $modules = $existingChoice.Toolchain
+    if ($NeedAndroid -and (-not $modules.BuildToolchainReady)) {
+        return [pscustomobject]@{ Success=$false; Stage='provisioning'; Exe=''; Reason=$modules.Reason; RawOutput='' }
     }
-    return [pscustomobject]@{ Success=$true; Stage='installed'; Exe=$existing.Exe; Reason='' }
+    return [pscustomobject]@{ Success=$true; Stage='installed'; Exe=$existing.Exe; Reason=$modules.Reason; RawOutput=''; Matches=@(Get-UnityEditors | Where-Object { $_.Version -eq $Version }); Chosen=$existing }
 }

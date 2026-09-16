@@ -161,9 +161,16 @@ function Test-CiAgentDoctor {
     $share = Get-SmbShare -Name 'UnityCI' -ErrorAction SilentlyContinue
     $shareOk = $share -and (Get-CiNormalizedPath $share.Path) -eq (Get-CiNormalizedPath $CiRoot)
     & $add 'SMB share' $shareOk "\\localhost\UnityCI -> $CiRoot"
+    $agentConfig = $null
+    try { $agentConfig = Read-CiConfig } catch {}
     $backend = Get-UnityProvisioningBackend
     $backendOk = $backend -and $backend.Name -ne 'none'
     & $add 'Unity provisioning backend' $backendOk $(if ($backendOk) { "$($backend.Name): $($backend.Path)" } else { 'missing' })
+    if ($agentConfig) {
+        foreach ($project in @($agentConfig.projects)) {
+            if ($project.unityVersion) { & $add "Unity $($project.name)" $true (Format-UnityEditorResolution "$($project.unityVersion)") }
+        }
+    }
     if ($backendOk) {
         $auth = Get-UnityAuthStatus $backend
         & $add 'Unity authentication' $auth.Authenticated $auth.Message
@@ -173,8 +180,6 @@ function Test-CiAgentDoctor {
         & $add 'Unity authentication' $false 'AUTH REQUIRED - install Unity CLI or login/configure Unity Hub'
         & $add 'Unity license' $false 'UNITY LICENSE REQUIRED - Unity CLI license status unavailable'
     }
-    $agentConfig = $null
-    try { $agentConfig = Read-CiConfig } catch {}
     $trustedPrefixes = if ($agentConfig -and (Test-CiHasProp $agentConfig 'allowedGitRemotePrefixes')) { @($agentConfig.allowedGitRemotePrefixes | Where-Object { "$_".Trim() }) } else { @() }
     & $add 'Unknown project trust' ($trustedPrefixes.Count -gt 0) $(if ($trustedPrefixes.Count -gt 0) { "$($trustedPrefixes.Count) trusted Git prefix(es)" } else { 'BLOCKED FOR UNKNOWN PROJECTS - configure allowedGitRemotePrefixes' })
     $heartbeat = @(Get-ChildItem -LiteralPath (Join-CiPath $CiRoot 'agents') -Filter '*.json' -ErrorAction SilentlyContinue |

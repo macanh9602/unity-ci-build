@@ -91,6 +91,9 @@ Write-Ok "CI ROOT READY: $ciRoot"
 if (@($config.allowedGitRemotePrefixes).Count -eq 0) {
     Write-Miss 'BLOCKED FOR UNKNOWN PROJECTS - configure allowedGitRemotePrefixes in config.json'
 }
+foreach ($project in @($config.projects)) {
+    if ($project.unityVersion) { Write-Info (Format-UnityEditorResolution "$($project.unityVersion)") }
+}
 
 $acl=Ensure-CiRootAcl $ciRoot; if ($acl.Success) { Write-Ok $acl.Message } else { Write-Miss "ACL: $($acl.Message)" }
 $fw=Ensure-CiSmbFirewall; if ($fw.Success) { Write-Ok $fw.Message } else { Write-Miss "Firewall: $($fw.Message)" }

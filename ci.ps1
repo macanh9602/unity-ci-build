@@ -274,13 +274,15 @@ switch ($Command) {
 
     Write-Info "Vai tro may nay: $($root.role)"
 
-    $agents = @(Get-CiAgents $root)
+    $agents = if ("$($root.role)" -eq 'agent') { @(Get-CiAgents $root) } else { @() }
     if ($agents.Count -gt 0) {
         Write-Host ''
         Write-Host '  MAY BUILD' -ForegroundColor Cyan
         foreach ($a in $agents) {
             if ($a.Alive) {
-                $txt = if ($a.state -eq 'building') { "dang build $($a.jobId)" } else { 'ranh' }
+                $txt = if ($a.state -eq 'building') { "dang build $($a.jobId)" }
+                       elseif ($a.state -eq 'preparing') { "dang chuan bi $($a.jobId)" }
+                       else { 'ranh' }
                 Write-Ok ("{0,-16} {1}" -f $a.name, $txt)
             } else {
                 Write-Miss ("{0,-16} khong thay phan hoi {1} truoc" -f $a.name, (Format-Duration $a.AgeSeconds))

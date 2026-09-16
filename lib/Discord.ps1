@@ -183,7 +183,8 @@ function Send-DiscordBuildResult {
     }
     # Mot build = mot card: sua chinh tin nhan tien do thanh ket qua cuoi
     if ($MessageId) {
-        if (Edit-DiscordMessage -WebhookUrl $WebhookUrl -MessageId $MessageId -Payload $payload) { return }
+        [void](Edit-DiscordMessage -WebhookUrl $WebhookUrl -MessageId $MessageId -Payload $payload)
+        return
     }
     Send-DiscordRaw -WebhookUrl $WebhookUrl -Payload $payload | Out-Null
 }

@@ -382,11 +382,11 @@ function Invoke-UnityBuild {
 
 # ------------------------------------------------------------
 function Invoke-CiJob {
-    param($Config, $Job, $Secrets, [string]$Webhook, [string]$JobFile, [switch]$WorktreeSynced)
+    param($Config, $Job, $Secrets, [string]$Webhook, [string]$JobFile, [string]$MessageId = '', [datetime]$StartedAt, [switch]$WorktreeSynced)
 
     $paths   = Get-CiPaths $Config
     Initialize-CiDirs $Config
-    $started = Get-Date
+    $started = if ($StartedAt) { $StartedAt } else { Get-Date }
     $logPath = Join-CiPath $paths.Logs   ("{0}.log"        -f $Job.id)
     $errPath = Join-CiPath $paths.Logs   ("{0}.errors.txt" -f $Job.id)
     if (-not $JobFile) { throw "PREPARATION_FAILURE | missing processing job file" }
@@ -396,8 +396,7 @@ function Invoke-CiJob {
     # Uoc tinh tu cac lan build thanh cong truoc do cua dung loai nay
     $eta = Get-CiEtaSeconds -Config $Config -ProjectName $Config.projectName `
                             -Format "$($Job.format)" -BuildConfig "$($Job.config)"
-    $msgId = ''
-    if ($Webhook) { $msgId = Send-DiscordBuildStarted -WebhookUrl $Webhook -Job $Job -EtaSeconds $eta }
+    $msgId = $MessageId
 
     $success = $false; $cancelled = $false; $failReason = ''; $sizeBytes = 0; $link = ''; $errInfo = $null
     $publishError = ''
@@ -409,6 +408,7 @@ function Invoke-CiJob {
             throw 'Da huy truoc khi build bat dau'
         }
         if (-not $WorktreeSynced) { Sync-Worktree -Config $Config -Sha $Job.sha -GitRemote "$($Job.gitRemote)" }
+        Update-CiDiscordPhase -Webhook $Webhook -MessageId $msgId -Job $Job -Phase 'Kiem tra Library cache' -StartedAt $started
         $cacheState = Sync-CiUnityCache -Config $Config
         Copy-CiScript  -Config $Config
 
@@ -527,7 +527,7 @@ function Invoke-CiJob {
 #  Nho vay them project moi chi phai cau hinh o may dev.
 # ------------------------------------------------------------
 function Register-CiProjectFromJob {
-    param($Root, $Job)
+    param($Root, $Job, [string]$Webhook = '', [string]$MessageId = '', [datetime]$StartedAt)
 
     $name = "$($Job.project)"
     if (-not $name) { throw "Job khong co ten project" }
@@ -557,16 +557,22 @@ function Register-CiProjectFromJob {
         if (-not (Test-CiWorktreeUsable $wt)) { throw "GIT_FAILURE | Clone that bai tu: $remote`n$cloneOutput" }
     }
 
+    Update-CiDiscordPhase -Webhook $Webhook -MessageId $MessageId -Job $Job -Phase 'Dong bo Git' -StartedAt $StartedAt
     $syncConfig = [pscustomobject]@{ ciRoot=$Root.ciRoot; projectName=$name; projectPath=''; worktreePath=$wt; gitRemote=$remote }
     try { Sync-Worktree -Config $syncConfig -Sha "$($Job.sha)" -GitRemote $remote }
     catch { throw "GIT_FAILURE | $($_.Exception.Message)" }
 
     try { $ver = Get-CiUnityVersionAtCommit -WorktreePath $wt -Sha "$($Job.sha)" }
     catch { throw "PREFLIGHT_FAILURE | $($_.Exception.Message)" }
+    Write-RunnerLog $Root (Format-UnityEditorResolution $ver)
+    Update-CiDiscordPhase -Webhook $Webhook -MessageId $MessageId -Job $Job -Phase "Kiem tra Unity $ver" -StartedAt $StartedAt
     $autoProvision = $true
     if (Test-CiHasProp $Root 'autoProvisionUnity') { $autoProvision = [bool]$Root.autoProvisionUnity }
-    $provision = Ensure-UnityEditor -Version $ver -NeedAndroid $true -AutoInstall $autoProvision
-    if (-not $provision.Success) {
+    Update-CiDiscordPhase -Webhook $Webhook -MessageId $MessageId -Job $Job -Phase 'Cai Unity/Android modules' -StartedAt $StartedAt
+        $provision = Ensure-UnityEditor -Version $ver -NeedAndroid $true -AutoInstall $autoProvision
+        Write-RunnerLog $Root "ANDROID TOOLCHAIN [$name]: $($provision.Reason)"
+        if ($provision.RawOutput) { Write-RunnerLog $Root "PROVISIONING RAW OUTPUT [$name]: $($provision.RawOutput)" }
+        if (-not $provision.Success) {
         throw "PROVISIONING_FAILED | Required Unity: $ver | Stage: $($provision.Stage) | Reason: $($provision.Reason)"
     }
     $exe = $provision.Exe
@@ -612,36 +618,49 @@ function Assert-CiJobCredentials {
 }
 
 function Write-CiPreflightFailureResult {
-    param($Root, $Job, [string]$Message)
+    param($Root, $Job, [string]$Message, [datetime]$StartedAt, [bool]$Cancelled = $false)
     $stage = 'preflight'
     if ($Message -match '^REMOTE_NOT_TRUSTED|^GIT_FAILURE') { $stage = 'git' }
     elseif ($Message -match '^PROVISIONING_FAILED') { $stage = 'provisioning' }
     elseif ($Message -match '^CREDENTIALS_REQUIRED') { $stage = 'credentials' }
     Write-JsonFile (Join-CiPath $Root.ciRoot 'results' ("{0}.json" -f $Job.id)) ([pscustomobject]@{
-        id=$Job.id; project=$Job.project; success=$false; cancelled=$false; branch=$Job.branch
+        id=$Job.id; project=$Job.project; success=$false; cancelled=$Cancelled; branch=$Job.branch
         sha=$Job.sha; shaShort=$Job.shaShort; format=$Job.format; config=$Job.config
-        failureStage=$stage; failReason=$Message; finishedAt=(Get-Date).ToString('o')
+        failureStage=$stage; failReason=$Message; durationSec=[math]::Round(((Get-Date) - $StartedAt).TotalSeconds, 1); finishedAt=(Get-Date).ToString('o')
     })
 }
 
+function Update-CiDiscordPhase {
+    param([string]$Webhook, [string]$MessageId, $Job, [string]$Phase, [datetime]$StartedAt, [double]$EtaSeconds = 0)
+    if (-not $Webhook -or -not $MessageId) { return }
+    Update-DiscordBuildProgress -WebhookUrl $Webhook -MessageId $MessageId -Job $Job -Phase $Phase `
+        -ElapsedSeconds ((Get-Date) - $StartedAt).TotalSeconds -EtaSeconds $EtaSeconds
+}
+
 function Resolve-CiJobConfig {
-    param($Root, $Job)
+    param($Root, $Job, [string]$Webhook = '', [string]$MessageId = '', [datetime]$StartedAt)
     $p = $Root.projects | Where-Object { $_.name -eq "$($Job.project)" } | Select-Object -First 1
     if ($p -and (Test-CiWorktreeUsable $p.worktreePath)) {
         $cfg = Get-EffectiveConfig $Root "$($Job.project)"
+        Update-CiDiscordPhase -Webhook $Webhook -MessageId $MessageId -Job $Job -Phase 'Dong bo Git' -StartedAt $StartedAt
         try { Sync-Worktree -Config $cfg -Sha "$($Job.sha)" -GitRemote "$($Job.gitRemote)" }
         catch { throw "GIT_FAILURE | $($_.Exception.Message)" }
         try { $ver = Get-CiUnityVersionAtCommit -WorktreePath $cfg.worktreePath -Sha "$($Job.sha)" }
         catch { throw "PREFLIGHT_FAILURE | $($_.Exception.Message)" }
+        Write-RunnerLog $Root (Format-UnityEditorResolution $ver)
+        Update-CiDiscordPhase -Webhook $Webhook -MessageId $MessageId -Job $Job -Phase "Kiem tra Unity $ver" -StartedAt $StartedAt
         $autoProvision = if (Test-CiHasProp $Root 'autoProvisionUnity') { [bool]$Root.autoProvisionUnity } else { $true }
+        Update-CiDiscordPhase -Webhook $Webhook -MessageId $MessageId -Job $Job -Phase 'Cai Unity/Android modules' -StartedAt $StartedAt
         $provision = Ensure-UnityEditor -Version $ver -NeedAndroid $true -AutoInstall $autoProvision
+        Write-RunnerLog $Root "ANDROID TOOLCHAIN [$($Job.project)]: $($provision.Reason)"
+        if ($provision.RawOutput) { Write-RunnerLog $Root "PROVISIONING RAW OUTPUT [$($Job.project)]: $($provision.RawOutput)" }
         if (-not $provision.Success) { throw "PROVISIONING_FAILED | Required Unity: $ver | Stage: $($provision.Stage) | Reason: $($provision.Reason)" }
         $p.unityVersion = $ver
         $p.unityExe = $provision.Exe
         Write-CiConfig $Root
         return (Get-EffectiveConfig $Root "$($Job.project)")
     }
-    return (Register-CiProjectFromJob $Root $Job)
+    return (Register-CiProjectFromJob $Root $Job -Webhook $Webhook -MessageId $MessageId -StartedAt $StartedAt)
 }
 
 # Nhip tim cua agent - de may dev biet agent con song hay da chet
@@ -702,17 +721,25 @@ try {
         $jobFile = Move-CiJobToProcessing -Config $root -Job $job -AgentName "$($root.agentName)"
         if (-not $jobFile) { continue }
         $job | Add-Member -NotePropertyName _file -NotePropertyValue $jobFile -Force
+        $startedAt = Get-Date
+        $messageId = if ($webhook) { Send-DiscordBuildStarted -WebhookUrl $webhook -Job $job -EtaSeconds 0 } else { '' }
         Write-CiHeartbeat $root 'preparing' $job.id
+        Update-CiDiscordPhase -Webhook $webhook -MessageId $messageId -Job $job -Phase 'Kiem tra credential' -StartedAt $startedAt
         try {
             $secrets = Read-CiSecrets
             Assert-CiJobCredentials -Root $root -Job $job -Secrets $secrets
             if (Test-CiCancelRequested $root $job.id) { throw 'PREPARATION_FAILURE | job cancelled before preparation' }
-            $jobCfg = Resolve-CiJobConfig $root $job
+            $jobCfg = Resolve-CiJobConfig $root $job -Webhook $webhook -MessageId $messageId -StartedAt $startedAt
             if (Test-CiCancelRequested $root $job.id) { throw 'PREPARATION_FAILURE | job cancelled during preparation' }
         } catch {
             $message = $_.Exception.Message
             Write-RunnerLog $root "BO QUA $($job.id): $message"
-            Write-CiPreflightFailureResult -Root $root -Job $job -Message $message
+            $cancelledPrep = $message -match '(?i)cancel|huy'
+            Write-CiPreflightFailureResult -Root $root -Job $job -Message $message -StartedAt $startedAt -Cancelled $cancelledPrep
+            $discordFailure = $message
+            if ($message -match '(PROVISIONING_NETWORK_FAILED[^\r\n]*)') { $discordFailure = $Matches[1] }
+            Send-DiscordBuildResult -WebhookUrl $webhook -Job $job -Success $false -Cancelled $cancelledPrep `
+                -DurationSeconds ((Get-Date) - $startedAt).TotalSeconds -ErrorSummary $discordFailure -MessageId $messageId
             # day sang failed/ de khong lap vo han tren cung mot job hong
             try {
                 $failDir = Join-CiPath $root.ciRoot 'failed'
@@ -723,7 +750,8 @@ try {
         }
 
         Write-CiHeartbeat $root 'building' $job.id
-        Invoke-CiJob -Config $jobCfg -Job $job -Secrets $secrets -Webhook $webhook -JobFile $jobFile -WorktreeSynced | Out-Null
+        Invoke-CiJob -Config $jobCfg -Job $job -Secrets $secrets -Webhook $webhook -JobFile $jobFile `
+            -MessageId $messageId -StartedAt $startedAt -WorktreeSynced | Out-Null
         Write-CiHeartbeat $root 'idle'
 
         if ($Once) { break }
