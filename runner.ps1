@@ -200,6 +200,7 @@ function Invoke-CiJob {
     if ($Webhook) { $msgId = Send-DiscordBuildStarted -WebhookUrl $Webhook -Job $Job -EtaSeconds $eta }
 
     $success = $false; $cancelled = $false; $failReason = ''; $sizeBytes = 0; $link = ''; $errInfo = $null
+    $publishError = ''
 
     try {
         # Huy ngay tu truoc khi Unity kip chay
@@ -254,7 +255,10 @@ function Invoke-CiJob {
             elseif ($up.Target)  { $link = '`' + $up.Target + '`' }
             Write-RunnerLog $Config "da dua file den: $($up.Target)"
         } else {
-            Write-RunnerLog $Config "dua file di that bai: $($up.Message)"
+            # Build xong ma file khong toi duoc tester thi coi nhu chua xong viec.
+            # Phai bao len Discord, khong duoc de chim trong runner.log.
+            $publishError = if ($up.Message) { "$($up.Message)" } else { 'khong ro nguyen nhan' }
+            Write-RunnerLog $Config "dua file di that bai: $publishError"
         }
     }
 
@@ -278,6 +282,7 @@ function Invoke-CiJob {
         outputPath  = $(if ($success) { $Job.outputPath } else { '' })
         sizeBytes   = $sizeBytes
         driveLink   = $link
+        publishError= $publishError
         durationSec = [math]::Round($duration, 1)
         finishedAt  = (Get-Date).ToString('o')
         failReason  = $failReason
@@ -299,7 +304,7 @@ function Invoke-CiJob {
             -DurationSeconds $duration -OutputPath $Job.outputPath -SizeBytes $sizeBytes `
             -ShareLink $link -ErrorSummary $(if ($cancelled) { '' } else { $summaryText }) `
             -ErrorFile $(if ($success -or $cancelled) { '' } else { Split-Path -Leaf $errPath }) `
-            -MessageId $msgId
+            -PublishError $publishError -MessageId $msgId
     }
 
     $tag = if ($success) { 'XONG' } elseif ($cancelled) { 'HUY ' } else { 'HONG' }

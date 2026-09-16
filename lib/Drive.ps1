@@ -92,6 +92,128 @@ function Find-SyncFolders {
     return $found.ToArray()
 }
 
+# Thu dich den TRUOC khi build, thay vi de phat hien sau 20 phut.
+function Test-CiPublishTarget {
+    param($Config)
+    $r = [pscustomobject]@{ Ok = $true; Mode = 'none'; Detail = ''; Message = '' }
+    if (-not $Config.drive) { return $r }
+    $mode = "$($Config.drive.mode)"
+    if (-not $mode -or $mode -eq 'none') { return $r }
+    $r.Mode = $mode
+
+    if ($mode -eq 'folder') {
+        $dst = "$($Config.drive.folderPath)"
+        $r.Detail = $dst
+        if (-not $dst) { $r.Ok = $false; $r.Message = 'Chua cau hinh folderPath'; return $r }
+        try {
+            if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Force -Path $dst -ErrorAction Stop | Out-Null }
+            $probe = Join-CiPath $dst ('.ci-write-test-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+            Set-Utf8NoBom -Path $probe -Text 'x'
+            Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+        } catch { $r.Ok = $false; $r.Message = $_.Exception.Message }
+        return $r
+    }
+
+    if ($mode -eq 'rclone') {
+        $exe = Find-Rclone $Config.drive.rclonePath
+        if (-not $exe) { $r.Ok = $false; $r.Message = 'Khong tim thay rclone'; return $r }
+        $remote = "$($Config.drive.remote)"
+        if ($remote -and -not $remote.EndsWith(':')) { $remote += ':' }
+        $folder = "$($Config.drive.folder)"
+        $dest   = if ($folder) { "$remote$folder" } else { $remote }
+        $r.Detail = $dest
+
+        $extra = @()
+        $rid = "$($Config.drive.rootFolderId)"
+        if ($rid) { $extra += @('--drive-root-folder-id', $rid); $r.Detail += "  (folder ID $rid)" }
+
+        $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        try {
+            $out = & $exe lsd $dest @extra 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                $r.Ok = $false
+                $raw = (($out | ForEach-Object { "$_" }) -join ' ').Trim()
+                $raw = $raw -replace '\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} ', ''
+                if (-not $raw) { $raw = "rclone lsd exit $LASTEXITCODE" }
+                $hint = Get-CiRcloneHint $raw
+                $r.Message = if ($hint) { $raw + "  ->  " + $hint } else { $raw }
+            }
+        } catch { $r.Ok = $false; $r.Message = $_.Exception.Message }
+        finally { $ErrorActionPreference = $old }
+        return $r
+    }
+
+    $r.Ok = $false; $r.Message = "Che do khong hop le: $mode"
+    return $r
+}
+
+# rclone bao loi bang tieng Anh kem chi tiet; doi chieu sang viec can lam
+# Liet ke remote KEM LOAI. Quan trong: --drive-root-folder-id chi co tac dung
+# voi remote loai 'drive'. Remote loai khac thi co ma bi BO QUA IM LANG,
+# file se di lac cho ma khong bao gi.
+function Get-RcloneRemoteList {
+    param([string]$RclonePath)
+    $exe = Find-Rclone $RclonePath
+    if (-not $exe) { return @() }
+    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $out = New-Object System.Collections.ArrayList
+    try {
+        $lines = & $exe listremotes --long 2>$null
+        if ($LASTEXITCODE -eq 0 -and $lines) {
+            foreach ($l in $lines) {
+                $t = ("$l").Trim()
+                if (-not $t) { continue }
+                $parts = $t -split '\s+', 2
+                $name = $parts[0].TrimEnd(':')
+                $type = if ($parts.Count -gt 1) { $parts[1].Trim() } else { '' }
+                [void]$out.Add([pscustomobject]@{ Name = $name; Type = $type })
+            }
+            return $out.ToArray()
+        }
+        # rclone doi cu khong co --long -> hoi tung remote mot
+        $names = & $exe listremotes 2>$null
+        foreach ($n in $names) {
+            $name = ("$n").Trim().TrimEnd(':')
+            if (-not $name) { continue }
+            $type = ''
+            $cfg = & $exe config show $name 2>$null
+            foreach ($c in $cfg) { if ("$c" -match '^\s*type\s*=\s*(\S+)') { $type = $Matches[1]; break } }
+            [void]$out.Add([pscustomobject]@{ Name = $name; Type = $type })
+        }
+        return $out.ToArray()
+    } catch { return @() } finally { $ErrorActionPreference = $old }
+}
+
+function Get-RcloneRemoteType {
+    param([string]$RclonePath, [string]$Remote)
+    $n = ("$Remote").TrimEnd(':')
+    $r = @(Get-RcloneRemoteList $RclonePath) | Where-Object { $_.Name -eq $n } | Select-Object -First 1
+    if ($r) { return $r.Type }
+    return ''
+}
+
+function Get-CiRcloneHint {
+    param([string]$Message)
+    if (-not $Message) { return '' }
+    $m = $Message.ToLower()
+    if ($m -match "didn't find section|couldn't find remote|unknown remote") {
+        return "Khong co remote do trong rclone. Chay: rclone listremotes"
+    }
+    if ($m -match 'directory not found|404|not found') {
+        return "Khong vao duoc folder. Neu no nam trong 'Shared with me' thi phai tao shortcut vao My Drive truoc (chuot phai folder > Organise > Add shortcut to Drive)."
+    }
+    if ($m -match '403|permission|forbidden|insufficient') {
+        return 'Khong co quyen ghi vao folder do. Xin quyen Editor tu chu folder.'
+    }
+    if ($m -match 'quota|storage.*full|limit') {
+        return 'Drive het dung luong hoac cham gioi han upload trong ngay.'
+    }
+    if ($m -match 'token|oauth|unauthenticated|401') {
+        return 'Token het han. Chay lai: rclone config reconnect <ten-remote>:'
+    }
+    return ''
+}
+
 function Publish-CiArtifact {
     param($Config, [string]$FilePath)
 
@@ -134,8 +256,20 @@ function Publish-CiArtifact {
 
             $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
             try {
-                & $exe copy $FilePath $dest --no-traverse @extra 2>&1 | Out-Null
-                if ($LASTEXITCODE -ne 0) { $r.Message = "rclone copy loi (exit $LASTEXITCODE)"; return $r }
+                # GIU output cua rclone lai. Truoc day doan nay day thang vao
+                # Out-Null roi chi bao exit code - tuc la vut dung cai thong bao
+                # loi di roi phan nan la khong biet vi sao hong.
+                $out = & $exe copy $FilePath $dest --no-traverse @extra 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    $raw = (($out | ForEach-Object { "$_" }) -join ' ').Trim()
+                    # bo phan tien to thoi gian cua rclone cho de doc
+                    $raw = $raw -replace '\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} ', ''
+                    if ($raw.Length -gt 600) { $raw = $raw.Substring(0, 600) + '...' }
+                    if (-not $raw) { $raw = "rclone copy exit $LASTEXITCODE" }
+                    $hint = Get-CiRcloneHint $raw
+                    $r.Message = if ($hint) { $raw + "  ->  " + $hint } else { $raw }
+                    return $r
+                }
                 $r.Published = $true
                 $r.Target    = $dest
                 if ($Config.drive.makeLink) {

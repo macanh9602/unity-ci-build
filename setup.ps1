@@ -431,6 +431,34 @@ if ($CheckOnly) {
                 [void]$blockers.Add("worktree $($p.name)")
             }
         }
+
+        # Hai project do file vao cung mot cho la gan nhu chac chan dan nham link
+        $seen = @{}
+        foreach ($p in $existing.projects) {
+            $key = "$($p.drive.rootFolderId)|$($p.drive.folderPath)"
+            if ($key -eq '|') { continue }
+            if ($seen.ContainsKey($key)) {
+                Write-Bad "Project '$($p.name)' va '$($seen[$key])' dang do file vao CUNG MOT cho"
+                Write-Hint 'Gan nhu chac chan la dan nham link. Sua drive.rootFolderId trong config.json.'
+            } else { $seen[$key] = $p.name }
+        }
+
+        # Thu dich den that su - de biet TRUOC khi ton 20 phut build
+        Write-Title 'Noi dua file cho tester'
+        foreach ($p in $existing.projects) {
+            $eff = Get-EffectiveConfig $existing $p.name
+            $t = Test-CiPublishTarget $eff
+            if ($t.Mode -eq 'none') { Write-Info "$($p.name): khong bat"; continue }
+            if ($t.Ok) { Write-Ok "$($p.name) -> $($t.Detail)" }
+            else {
+                Write-Bad "$($p.name) -> $($t.Detail)"
+                Write-Hint $t.Message
+                if ($t.Message -match 'not found|404|shortcut|permission|403') {
+                    Write-Hint 'Folder trong muc "Shared with me"? Phai tao shortcut vao My Drive truoc.'
+                }
+                [void]$blockers.Add("noi dua file cua $($p.name)")
+            }
+        }
     }
 
     Write-Title 'Ket qua kiem tra'

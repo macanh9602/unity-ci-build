@@ -211,7 +211,7 @@ Trong Unity có nút **Huỷ** hiện dưới nút Build khi có job đang chạ
 - **Job đang chờ** — xoá file khỏi queue, xong ngay.
 - **Job đang chạy** — không giết tiến trình từ xa được (có thể ở máy khác), nên đặt file cờ `cancel/<id>.flag`. Runner nhặt ở **vòng poll 3 giây sẵn có** rồi tự giết Unity.
 
-Build bị huỷ **không bị coi là thất bại**: Discord tô xám, tiêu đề `BUILD DA HUY`, không sinh `errors.txt` — có gì hỏng đâu mà đọc log nhể
+Build bị huỷ **không bị coi là thất bại**: Discord tô xám, tiêu đề `BUILD DA HUY`, không sinh `errors.txt` — có gì hỏng đâu mà đọc log.
 
 ---
 
@@ -269,6 +269,20 @@ Chọn một trong ba lúc cài:
 **Chỉ dán link Drive thôi thì không đủ** — link là địa chỉ, không phải chìa khoá; Google bắt buộc OAuth mới cho ghi. Nhưng nếu đã share sẵn folder và có link, dán vào lúc cài thì Discord kèm link đó vào mọi thông báo.
 
 Chọn rclone thì wizard tự chạy `rclone config create gdrive drive scope=drive` — lệnh này lấy mặc định cho mọi câu hỏi, nên cuộc phỏng vấn ~10 bước rút còn một bước: bấm Allow trên trình duyệt.
+
+Build xong mà file không tới được tester thì Discord **không báo xanh** — card chuyển màu cam, tiêu đề `BUILD XONG - NHUNG UPLOAD HONG`, kèm lý do và đường dẫn file còn nằm trên máy build. Báo xanh ở đây là nói dối: tester sẽ ngồi đợi một file không bao giờ đến.
+
+`ci.ps1 doctor` thử thật đích đến trước khi bạn tốn 20 phút build, và cảnh báo nếu hai project trỏ vào cùng một folder.
+
+### Upload hỏng thì chạy
+
+```powershell
+.\ci.ps1 drive          # hoặc double-click drive-fix.bat
+```
+
+Nó tự chẩn rồi tự sửa: liệt kê remote **kèm loại**, thử từng project, và tuỳ lỗi mà đề nghị đúng việc — hết token thì mở trình duyệt đăng nhập lại, chưa có remote Drive thì tạo mới, folder sai thì chỉ chỗ sửa. Sửa xong nó thử lại ngay.
+
+Điểm dễ dính nhất mà nhìn config không thấy: **`--drive-root-folder-id` chỉ có tác dụng với remote loại `drive`**. Remote loại khác sẽ **bỏ qua ID im lặng** — không báo lỗi, file cứ thế đi lạc chỗ. Lệnh này in loại của từng remote nên bắt được ngay.
 
 ### Folder nằm trong "Shared with me"
 
@@ -360,7 +374,10 @@ Lỡ commit rồi thì **đổi webhook và mật khẩu keystore**, đừng ch�
 | Build hỏng | `logs/<id>.errors.txt` — đã tách lỗi compile và lỗi đóng gói |
 | Không thấy build chạy | `runner.log` |
 | Máy build im lặng | `.\ci.ps1 status` |
+| Build xong nhưng Drive trống | Card Discord màu cam ghi rõ lý do; `.\ci.ps1 doctor` thử lại đích đến |
 | Nghi thiếu gì đó trên máy | `.\ci.ps1 doctor` |
+| Thiếu worktree | `.\ci.ps1 repair` tạo lại |
+| Upload Drive hỏng | `.\ci.ps1 drive` chẩn và sửa |
 | Muốn xem log Unity đầy đủ | `logs/<id>.log` |
 
 `errors.txt` phân biệt hai loại hỏng khác hẳn nhau: **lỗi compile** (code không build được) và **lỗi đóng gói player**. Nếu Unity chết trước khi kịp chạy thì nó nói thẳng `UNITY CHUA TUNG CHAY` kèm bốn nguyên nhân thường gặp, thay vì để bạn đọc một file rỗng.

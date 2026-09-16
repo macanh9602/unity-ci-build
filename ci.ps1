@@ -13,7 +13,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position=0)]
-    [ValidateSet('build','cancel','status','queue','projects','branches','open','config','doctor','help')]
+    [ValidateSet('build','cancel','status','queue','projects','branches','open','config','doctor','repair','drive','help')]
     [string]$Command = 'help',
 
     [Parameter(Position=1)][string]$JobId = '',
@@ -31,6 +31,7 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib\Common.ps1')
 . (Join-Path $PSScriptRoot 'lib\Queue.ps1')
+. (Join-Path $PSScriptRoot 'lib\Drive.ps1')
 Set-ConsoleUtf8
 
 if (-not (Test-CiInstalled)) {
@@ -313,6 +314,7 @@ switch ($Command) {
             "$($r.project)", $r.branch, $r.shaShort, "$($r.format)".ToUpper(), $r.config, (Format-Duration $r.durationSec))
         if ($r.success -and $r.outputPath) { Write-Hint (Split-Path -Leaf $r.outputPath) }
         elseif ($r.failReason)             { Write-Hint $r.failReason }
+        if ($r.publishError) { Write-Host '          upload hong: ' -ForegroundColor Yellow -NoNewline; Write-Host $r.publishError -ForegroundColor Yellow }
     }
 }
 
@@ -370,6 +372,151 @@ switch ($Command) {
     if (Read-YesNo 'Mo config.json ngay?' $true) { Start-Process notepad.exe (Get-ConfigPath) }
 }
 
+'drive' {
+    Write-Title 'Chan va sua ket noi Drive'
+
+    $rcPath = ''
+    foreach ($p in $root.projects) { if ($p.drive.rclonePath) { $rcPath = $p.drive.rclonePath; break } }
+    $exe = Find-Rclone $rcPath
+    if (-not $exe) {
+        Write-Bad 'Khong tim thay rclone tren may nay.'
+        Write-Hint 'Cai bang: winget install --id Rclone.Rclone -e'
+        break
+    }
+    Write-Ok "rclone: $exe"
+
+    # --- 1. Remote nao dang co, loai gi ---
+    Write-Host ''
+    Write-Host '  REMOTE DANG CO' -ForegroundColor Cyan
+    $remotes = @(Get-RcloneRemoteList $exe)
+    if ($remotes.Count -eq 0) {
+        Write-Miss 'Chua co remote nao.'
+    } else {
+        foreach ($r in $remotes) {
+            if ($r.Type -eq 'drive') { Write-Ok ("{0,-16} {1}" -f $r.Name, $r.Type) }
+            else                     { Write-Miss ("{0,-16} {1}   <- KHONG phai Google Drive" -f $r.Name, $r.Type) }
+        }
+    }
+
+    # --- 2. Tung project ---
+    foreach ($p in $root.projects) {
+        if ("$($p.drive.mode)" -ne 'rclone') { continue }
+
+        Write-Host ''
+        Write-Host ("  PROJECT: " + $p.name) -ForegroundColor Cyan
+        $remoteName = "$($p.drive.remote)".TrimEnd(':')
+        $entry = $remotes | Where-Object { $_.Name -eq $remoteName } | Select-Object -First 1
+
+        if (-not $entry) {
+            Write-Bad "Remote '$remoteName' khong ton tai trong rclone"
+            Write-Hint "Sua drive.remote trong config.json, hoac tao remote moi (xem cuoi)"
+            continue
+        }
+
+        if ($entry.Type -ne 'drive') {
+            Write-Bad "Remote '$remoteName' la loai '$($entry.Type)', KHONG phai Google Drive"
+            Write-Hint 'Ghim folder bang ID chi co tac dung voi remote loai drive.'
+            Write-Hint 'Remote loai khac se bo qua ID im lang -> file di lac cho.'
+            Write-Hint 'Phai tao mot remote Google Drive moi (xem cuoi).'
+            continue
+        }
+
+        $eff = Get-EffectiveConfig $root $p.name
+        $t = Test-CiPublishTarget $eff
+        if ($t.Ok) { Write-Ok "Vao duoc: $($t.Detail)"; continue }
+
+        Write-Bad "Khong vao duoc: $($t.Detail)"
+        Write-Info "  $($t.Message)"
+
+        if ($t.Message -match '401|token|oauth|unauthenticated|Not authenticated') {
+            Write-Host ''
+            if (Read-YesNo "  Dang nhap lai remote '$remoteName' ngay? (trinh duyet se mo)" $true) {
+                Write-Info 'Dang mo trinh duyet...'
+                $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+                try { & $exe config reconnect ($remoteName + ':') } finally { $ErrorActionPreference = $old }
+                Write-Host ''
+                $t2 = Test-CiPublishTarget $eff
+                if ($t2.Ok) { Write-Ok 'Da vao duoc' }
+                else { Write-Bad "Van chua duoc: $($t2.Message)" }
+            }
+        }
+        elseif ($t.Message -match 'not found|404') {
+            Write-Hint 'Folder nam trong "Shared with me"? Tao shortcut vao My Drive truoc:'
+            Write-Hint 'Chuot phai folder tren Drive > Organise > Add shortcut to Drive > My Drive'
+            Write-Hint "Hoac folder ID sai - sua projects[].drive.rootFolderId trong config.json"
+        }
+    }
+
+    # --- 3. Tao remote Google Drive moi ---
+    $hasDrive = @($remotes | Where-Object { $_.Type -eq 'drive' }).Count -gt 0
+    if (-not $hasDrive) {
+        Write-Host ''
+        Write-Miss 'Chua co remote Google Drive nao.'
+        if (Read-YesNo 'Tao ngay bay gio? (trinh duyet se mo, bam Allow la xong)' $true) {
+            $newName = Read-Choice 'Dat ten remote' 'gdrive'
+            Write-Host ''
+            New-RcloneDriveRemote -RclonePath $exe -Name $newName | Out-Null
+            Write-Host ''
+            $check = @(Get-RcloneRemoteList $exe) | Where-Object { $_.Name -eq $newName -and $_.Type -eq 'drive' }
+            if ($check) {
+                Write-Ok "Da tao remote '$newName'"
+                Write-Hint "Sua drive.remote thanh '$newName`:' trong config.json roi chay lai .\ci.ps1 drive"
+                if (Read-YesNo 'Mo config.json ngay?' $true) { Start-Process notepad.exe (Get-ConfigPath) }
+            } else {
+                Write-Bad 'Chua tao duoc - co the ban da dong trinh duyet giua chung'
+            }
+        }
+    }
+
+    Write-Host ''
+    Write-Hint 'Chay lai .\ci.ps1 drive de kiem tra sau khi sua'
+}
+
+'repair' {
+    Write-Title 'Sua nhung thu thieu'
+    $fixed = 0; $left = 0
+
+    foreach ($p in $root.projects) {
+        $wt = $p.worktreePath
+        if (Test-Path (Join-CiPath $wt '.git')) { Write-Ok "$($p.name): worktree da co"; continue }
+
+        Write-Info "$($p.name): chua co worktree -> dang tao"
+
+        # Co repo goc tren may nay thi dung git worktree (dung chung kho object,
+        # nhanh va khong ton dung luong). Khong co thi clone tu remote.
+        $made = $false
+        if ($p.projectPath -and (Test-Path (Join-CiPath $p.projectPath '.git'))) {
+            $parent = Split-Path -Parent $wt
+            if ($parent -and -not (Test-Path $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+            Invoke-Git $p.projectPath @('worktree','prune') | Out-Null
+            $r = Invoke-Git $p.projectPath @('worktree','add','--detach',$wt,'HEAD')
+            if ($r.ExitCode -eq 0 -and (Test-Path $wt)) { $made = $true }
+            else { Write-Info $r.Output }
+        }
+        elseif ($p.gitRemote) {
+            $parent = Split-Path -Parent $wt
+            if ($parent -and -not (Test-Path $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+            $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+            try { & git clone --quiet $p.gitRemote $wt 2>&1 | Out-Null } finally { $ErrorActionPreference = $old }
+            $made = Test-Path (Join-CiPath $wt '.git')
+        }
+
+        if ($made) { Write-Ok "$($p.name): da tao $wt"; $fixed++ }
+        else {
+            Write-Bad "$($p.name): khong tao duoc worktree"
+            Write-Hint 'Kiem tra projectPath va gitRemote trong config.json'
+            $left++
+        }
+    }
+
+    Write-Host ''
+    if ($fixed -gt 0) { Write-Ok "Da sua $fixed project" }
+    if ($left  -gt 0) { Write-Bad "Con $left project chua sua duoc" }
+    if ($fixed -eq 0 -and $left -eq 0) { Write-Info 'Khong co gi phai sua.' }
+    Write-Host ''
+    Write-Hint 'Phan rclone / Drive thi repair khong tu lam duoc - xem .\ci.ps1 doctor'
+}
+
 'doctor' {
     & (Join-Path $PSScriptRoot 'setup.ps1') -CheckOnly
 }
@@ -393,6 +540,8 @@ default {
   .\ci.ps1 open                         mo thu muc chua file build
   .\ci.ps1 config                       xem / doi duong dan, khong can cai lai
   .\ci.ps1 doctor                       kiem tra lai he thong
+  .\ci.ps1 repair                       tao lai worktree con thieu
+  .\ci.ps1 drive                        chan va sua ket noi Google Drive
 
   Hoac double-click build.bat de build nhanh ban dev.
 '@ -ForegroundColor Gray

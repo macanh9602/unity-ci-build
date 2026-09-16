@@ -123,13 +123,23 @@ function Send-DiscordBuildResult {
         [string]$ShareLink = '',
         [string]$ErrorSummary = '',
         [string]$ErrorFile = '',
+        [string]$PublishError = '',
         [string]$MessageId = ''
     )
     if ([string]::IsNullOrWhiteSpace($WebhookUrl)) { return }
 
     # Build bi huy khong phai that bai - to mau khac de khoi hoang
-    $color = if ($Success) { 3066993 } elseif ($Cancelled) { 9807270 } else { 15158332 }
-    $title = if ($Success) { 'BUILD THANH CONG' } elseif ($Cancelled) { 'BUILD DA HUY' } else { 'BUILD THAT BAI' }
+    # Build xong nhung file khong toi duoc tester -> mau cam, KHONG phai xanh:
+    # bao xanh o day la noi doi, tester se ngoi doi mot file khong bao gio den.
+    $partial = ($Success -and $PublishError)
+    $color = if ($partial)   { 15105570 }
+             elseif ($Success) { 3066993 }
+             elseif ($Cancelled) { 9807270 }
+             else { 15158332 }
+    $title = if ($partial)   { 'BUILD XONG - NHUNG UPLOAD HONG' }
+             elseif ($Success) { 'BUILD THANH CONG' }
+             elseif ($Cancelled) { 'BUILD DA HUY' }
+             else { 'BUILD THAT BAI' }
 
     $branchText = if ($Job.branch) { $Job.branch } else { '-' }
     $fields = @()
@@ -145,7 +155,11 @@ function Send-DiscordBuildResult {
         if ($SizeBytes -gt 0) { $fields += @{ name='Dung luong'; value=(Format-Bytes $SizeBytes); inline=$true } }
         if ($Job.versionCode -gt 0) { $fields += @{ name='versionCode'; value=[string]$Job.versionCode; inline=$true } }
         if ($OutputPath) { $fields += @{ name='File'; value=('`' + (Split-Path -Leaf $OutputPath) + '`'); inline=$false } }
-        if ($ShareLink)  { $fields += @{ name='Tester lay o day'; value=$ShareLink; inline=$false } }
+        if ($ShareLink)    { $fields += @{ name='Tester lay o day'; value=$ShareLink; inline=$false } }
+        if ($PublishError) {
+            $fields += @{ name='Khong dua file di duoc'; value=('```' + $PublishError + '```'); inline=$false }
+            $fields += @{ name='File van nam tren may build'; value=('`' + $OutputPath + '`'); inline=$false }
+        }
     } else {
         if ($ErrorFile) { $fields += @{ name='Chi tiet loi'; value=('`' + $ErrorFile + '`'); inline=$false } }
     }
