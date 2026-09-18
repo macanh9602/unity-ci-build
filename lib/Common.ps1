@@ -101,6 +101,10 @@ function ConvertTo-CiConfigV3 {
     if (-not (Test-CiHasProp $Cfg 'pollSeconds')) {
         Add-Member -InputObject $Cfg -NotePropertyName pollSeconds -NotePropertyValue 5 -Force
     }
+    if (-not (Test-CiHasProp $Cfg 'buildPerformanceMode')) {
+        $mode = if ("$($Cfg.role)" -eq 'agent') { 'max-speed' } else { 'balanced' }
+        Add-Member -InputObject $Cfg -NotePropertyName buildPerformanceMode -NotePropertyValue $mode -Force
+    }
     foreach ($name in @('autoProvisionUnity','autoShareCiRoot','autoCreateTask')) {
         if (-not (Test-CiHasProp $Cfg $name)) {
             Add-Member -InputObject $Cfg -NotePropertyName $name -NotePropertyValue $true -Force
@@ -130,6 +134,7 @@ function ConvertTo-CiConfigV2 {
         reserveCoresForEditor = $Cfg.reserveCoresForEditor
         buildTimeoutMinutes   = $Cfg.buildTimeoutMinutes
         useNographics         = $Cfg.useNographics
+        buildPerformanceMode  = if ($Cfg.buildPerformanceMode) { $Cfg.buildPerformanceMode } else { 'balanced' }
         autoProvisionUnity    = $Cfg.autoProvisionUnity
         autoShareCiRoot       = $Cfg.autoShareCiRoot
         autoCreateTask        = $Cfg.autoCreateTask
@@ -210,6 +215,7 @@ function Get-EffectiveConfig {
         reserveCoresForEditor = $Cfg.reserveCoresForEditor
         buildTimeoutMinutes   = $Cfg.buildTimeoutMinutes
         useNographics         = $Cfg.useNographics
+        buildPerformanceMode  = if ($Cfg.buildPerformanceMode) { $Cfg.buildPerformanceMode } else { if ("$($Cfg.role)" -eq 'agent') { 'max-speed' } else { 'balanced' } }
         autoProvisionUnity    = $Cfg.autoProvisionUnity
         autoShareCiRoot       = $Cfg.autoShareCiRoot
         autoCreateTask        = $Cfg.autoCreateTask
@@ -750,7 +756,7 @@ function ConvertTo-CiSafeName {
 }
 
 function Get-CiEtaSeconds {
-    param($Config, [string]$ProjectName, [string]$Format, [string]$BuildConfig, [int]$Samples = 5)
+    param($Config, [string]$ProjectName, [string]$Format, [string]$BuildConfig, [bool]$DevelopmentBuild = $false, [int]$Samples = 5)
     try {
         $paths = Get-CiPaths $Config
         if (-not (Test-Path $paths.Results)) { return 0 }
@@ -763,6 +769,8 @@ function Get-CiEtaSeconds {
             if ("$($r.project)" -ne $ProjectName) { continue }
             if ("$($r.format)"  -ne $Format)      { continue }
             if ("$($r.config)"  -ne $BuildConfig) { continue }
+            $oldDev = if (Test-CiHasProp $r 'developmentBuild') { [bool]$r.developmentBuild } else { $false }
+            if ($oldDev -ne $DevelopmentBuild) { continue }
             [void]$vals.Add([double]$r.durationSec)
             if ($vals.Count -ge $Samples) { break }
         }
@@ -770,6 +778,22 @@ function Get-CiEtaSeconds {
         $sorted = @($vals | Sort-Object)
         return [double]$sorted[[int][Math]::Floor($sorted.Count / 2)]
     } catch { return 0 }
+}
+
+function Get-CiPreviousSameProfileSize {
+    param($Config, [string]$ProjectName, [string]$Format, [string]$BuildConfig, [bool]$DevelopmentBuild)
+    try {
+        $paths = Get-CiPaths $Config
+        foreach ($f in @(Get-ChildItem -Path $paths.Results -Filter '*.json' -ErrorAction SilentlyContinue | Sort-Object Name -Descending)) {
+            $r = Read-JsonFile $f.FullName
+            $oldDev = if (Test-CiHasProp $r 'developmentBuild') { [bool]$r.developmentBuild } else { $false }
+            if ($r -and $r.success -and "$($r.project)" -eq $ProjectName -and "$($r.format)" -eq $Format -and
+                "$($r.config)" -eq $BuildConfig -and $oldDev -eq $DevelopmentBuild -and [long]$r.sizeBytes -gt 0) {
+                return $r
+            }
+        }
+    } catch {}
+    return $null
 }
 
 function Format-Bytes([long]$Bytes) {

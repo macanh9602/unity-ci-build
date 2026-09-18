@@ -40,7 +40,16 @@ $script:CiPhases = @(
 )
 
 function New-CiPhaseTracker {
-    [pscustomobject]@{ Pos = [long]0; Rank = 0; Name = 'Chuan bi' }
+    [pscustomobject]@{ Pos = [long]0; Rank = 0; Name = 'Chuan bi'; PhaseStartedAt = Get-Date; Durations = [ordered]@{} }
+}
+
+function Complete-CiPhaseTracker {
+    param($Tracker)
+    if ($Tracker -and $Tracker.Rank -gt 0 -and $Tracker.PhaseStartedAt) {
+        $seconds = ((Get-Date) - [datetime]$Tracker.PhaseStartedAt).TotalSeconds
+        $Tracker.Durations[$Tracker.Name] = [math]::Round($seconds, 1)
+    }
+    return $Tracker
 }
 
 # Chi doc phan MOI cua log moi lan goi, khong doc lai tu dau.
@@ -71,8 +80,12 @@ function Update-CiPhaseTracker {
         if ($ph.Rank -le $Tracker.Rank) { continue }
         foreach ($m in $ph.Markers) {
             if ($chunk.IndexOf($m, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                if ($Tracker.Rank -gt 0 -and $Tracker.PhaseStartedAt) {
+                    $Tracker.Durations[$Tracker.Name] = [math]::Round(((Get-Date) - [datetime]$Tracker.PhaseStartedAt).TotalSeconds, 1)
+                }
                 $Tracker.Rank = $ph.Rank
                 $Tracker.Name = $ph.Name
+                $Tracker.PhaseStartedAt = Get-Date
                 break
             }
         }

@@ -1,6 +1,7 @@
 ﻿# ============================================================
 #  ci.ps1 - dong lenh dieu khien
-#    .\ci.ps1 build                          APK dev, project mac dinh
+#    .\ci.ps1 build                          APK dev quick, project mac dinh
+#    .\ci.ps1 build -Development             APK dev voi Unity Development Build
 #    .\ci.ps1 build -Project SE-001          chon project khac
 #    .\ci.ps1 build -Format aab -Config release
 #    .\ci.ps1 projects                       liet ke project da khai bao
@@ -23,6 +24,7 @@ param(
     [string]$Branch  = '',
     [ValidateSet('apk','aab')]    [string]$Format = 'apk',
     [ValidateSet('dev','release')][string]$Config = 'dev',
+    [switch]$Development,
     [switch]$Force,
     [switch]$Local,    # ep build ngay tai may nay, khong hoi
     [switch]$Queue     # ep de trong queue cho may build, khong hoi
@@ -57,6 +59,15 @@ switch ($Command) {
 
     $git = Get-GitInfo $proj.projectPath
     if (-not $git) { Write-Bad "Khong doc duoc git tai $($proj.projectPath)"; exit 1 }
+    if ("$($root.role)" -eq 'client' -and $Local) {
+        Write-Bad 'May nay dang o role client. Muon build local hay chuyen sang standalone.'
+        exit 1
+    }
+    if ("$($root.role)" -eq 'client' -and -not (Test-CiClientShareReachable $root.ciRoot)) {
+        Write-Bad 'NETWORK/SMB BLOCKED: Khong ket noi duoc build machine / UnityCI share.'
+        Write-Hint 'Kiem tra hostname, trusted LAN/VPN route va firewall TCP 445 LocalSubnet.'
+        exit 1
+    }
 
     # Chon branch khac ma KHONG doi working copy - ban van code tiep binh thuong
     if ($Branch -and $Branch -ne $git.Branch) {
@@ -136,27 +147,25 @@ switch ($Command) {
         elseif ($Queue)  { Write-Info 'De job trong queue theo yeu cau.' }
         else {
             # Khong tu y build tai cho: may dev se bi an het CPU ma khong hieu vi sao
-            $cap = Test-CiCanBuildLocally $root $proj
             Write-Host ''
             Write-Miss 'Khong thay may build nao dang chay.'
             Write-Host ''
             Write-Host '    [1] De job trong queue - may build bat len la tu chay' -ForegroundColor Gray
-            if ($cap.Ok) {
-                if ($cap.NeedsWorktree) {
-                    Write-Host '    [2] Build ngay tai may nay' -ForegroundColor Yellow
-                    Write-Hint 'Lan dau phai tao ban sao project + import lai toan bo asset:'
-                    Write-Hint 'mat 20-40 phut va an gan het CPU. Doi may build co khi con nhanh hon.'
-                } else {
-                    Write-Host '    [2] Build ngay tai may nay (da co san ban sao project)' -ForegroundColor Yellow
-                }
+            if ("$($root.role)" -eq 'client') {
+                Write-Hint 'Client khong build local va khong can CI worktree. Job se nam trong queue.'
+                $pick = '1'
             } else {
-                Write-Host ('    [2] Build tai may nay - KHONG duoc: ' + $cap.Reason) -ForegroundColor DarkGray
-            }
-            Write-Host ''
-            $pick = Read-Choice 'Chon' '1'
-            if ($pick -eq '2') {
-                if (-not $cap.Ok) { Write-Bad $cap.Reason; exit 1 }
-                $buildHere = $true
+                $cap = Test-CiCanBuildLocally $root $proj
+                if ($cap.Ok) {
+                    Write-Host '    [2] Build ngay tai may nay' -ForegroundColor Yellow
+                    Write-Hint 'Lan dau phai tao ban sao project + import lai toan bo asset.'
+                } else { Write-Host ('    [2] Build tai may nay - KHONG duoc: ' + $cap.Reason) -ForegroundColor DarkGray }
+                Write-Host ''
+                $pick = Read-Choice 'Chon' '1'
+                if ($pick -eq '2') {
+                    if (-not $cap.Ok) { Write-Bad $cap.Reason; exit 1 }
+                    $buildHere = $true
+                }
             }
         }
     }
@@ -180,7 +189,7 @@ switch ($Command) {
     $job = Add-CiJob -Config $root -Sha $git.Sha -Branch $git.Branch -Subject $git.Subject `
                      -Format $Format -BuildConfig $Config -By 'cli' -VersionCode $git.CommitCount `
                      -Project $proj.name -Platform 'android' -TargetAgent $targetAgent `
-                     -GitRemote $remoteUrl -UnityVersion "$($proj.unityVersion)"
+                     -GitRemote $remoteUrl -UnityVersion "$($proj.unityVersion)" -DevelopmentBuild:$Development
 
     Write-Host ''
     Write-Ok "Da xep hang: $($job.id)  [$($proj.name)]"
@@ -195,9 +204,14 @@ switch ($Command) {
     } elseif ((@(Get-CiLiveAgents $root 'android')).Count -gt 0) {
         Write-Info 'Da gui sang may build.'
     } else {
-        Write-Info 'Job nam trong queue - may build bat len la tu chay.'
-        Write-Hint 'Tren may build: bat agent.bat hoac kiem tra Scheduled Task.'
-        Write-Hint 'Muon build ngay tai day: .\ci.ps1 build -Local'
+        Write-Info 'Job da nam trong queue.'
+        if ("$($root.role)" -eq 'client') {
+            Write-Hint 'Bat build agent de job tu chay.'
+            Write-Hint 'May nay la DEV CLIENT nen khong build local.'
+        } else {
+            Write-Hint 'Tren may build: bat agent.bat hoac kiem tra Scheduled Task.'
+            Write-Hint 'Muon build ngay tai day: .\ci.ps1 build -Local'
+        }
     }
     Write-Info "Theo doi: .\ci.ps1 status"
 }
@@ -314,10 +328,14 @@ switch ($Command) {
         $mark  = if ($r.success) { 'OK  ' } elseif ($r.cancelled) { 'HUY ' } else { 'HONG' }
         $color = if ($r.success) { 'Green' } elseif ($r.cancelled) { 'DarkGray' } else { 'Red' }
         Write-Host ('  {0}  ' -f $mark) -ForegroundColor $color -NoNewline
-        Write-Host ('{0,-18} {1}@{2}  {3}/{4}  {5}' -f `
-            "$($r.project)", $r.branch, $r.shaShort, "$($r.format)".ToUpper(), $r.config, (Format-Duration $r.durationSec))
+        $profile = if ($r.profile) { $r.profile } else { ("{0}/{1}/quick" -f ("$($r.format)".ToUpper(), $r.config)) }
+        $sizeText = if ($r.sizeBytes) { Format-Bytes $r.sizeBytes } else { '' }
+        Write-Host ('{0,-18} {1}@{2}  {3}  {4}  {5}' -f `
+            "$($r.project)", $r.branch, $r.shaShort, $profile, (Format-Duration $r.durationSec), $sizeText)
         if ($r.success -and $r.outputPath) { Write-Hint (Split-Path -Leaf $r.outputPath) }
         elseif ($r.failReason)             { Write-Hint $r.failReason }
+        if ($r.cacheState) { Write-Hint ("Cache: {0}{1}" -f $r.cacheState, $(if($r.cacheReason){" ($($r.cacheReason))"}else{''})) }
+        if ($null -ne $r.sizeDeltaPercent) { Write-Hint ("Same-profile size delta: {0}%" -f $r.sizeDeltaPercent) }
         if ($r.publishError) { Write-Host '          upload hong: ' -ForegroundColor Yellow -NoNewline; Write-Host $r.publishError -ForegroundColor Yellow }
     }
 }

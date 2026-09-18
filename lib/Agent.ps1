@@ -19,12 +19,21 @@ function Get-BestCiRoot {
 
 function Ensure-CiSmbFirewall {
     try {
-        $rules = @(Get-NetFirewallRule -DisplayGroup 'File and Printer Sharing' -ErrorAction Stop)
-        if ($rules.Count -gt 0) {
-            $rules | Where-Object Enabled -ne 'True' | Enable-NetFirewallRule -ErrorAction Stop | Out-Null
-            return [pscustomobject]@{ Success=$true; Message='SMB firewall: enabled' }
+        $profiles = @(Get-NetConnectionProfile -ErrorAction Stop)
+        if (@($profiles | Where-Object { $_.NetworkCategory -eq 'Public' }).Count -gt 0) {
+            return [pscustomobject]@{ Success=$false; PublicNetwork=$true; Message='Network dang o Public. Chuyen sang Private/Domain truoc khi mo SMB.' }
         }
-        return [pscustomobject]@{ Success=$false; Message='File and Printer Sharing firewall rules not found' }
+        $broad = @(Get-NetFirewallRule -DisplayGroup 'File and Printer Sharing' -ErrorAction SilentlyContinue)
+        if ($broad.Count -gt 0) { $broad | Set-NetFirewallRule -Enabled False -ErrorAction Stop }
+        $rule = Get-NetFirewallRule -DisplayName 'UnityCI SMB 445' -ErrorAction SilentlyContinue
+        if ($rule) {
+            Set-NetFirewallRule -DisplayName 'UnityCI SMB 445' -Enabled True -Profile Domain,Private -RemoteAddress LocalSubnet -ErrorAction Stop
+            Set-NetFirewallPortFilter -AssociatedNetFirewallRule $rule -Protocol TCP -LocalPort 445 -ErrorAction Stop | Out-Null
+        } else {
+            New-NetFirewallRule -DisplayName 'UnityCI SMB 445' -Direction Inbound -Action Allow -Enabled True `
+                -Profile Domain,Private -Protocol TCP -LocalPort 445 -RemoteAddress LocalSubnet -ErrorAction Stop | Out-Null
+        }
+        return [pscustomobject]@{ Success=$true; Message='SMB firewall: only Private/Domain TCP 445 from LocalSubnet' }
     } catch { return [pscustomobject]@{ Success=$false; Message=$_.Exception.Message } }
 }
 
@@ -38,25 +47,79 @@ function Ensure-CiRootAcl {
         }
         $auth = 'Authenticated Users'
         $buildUser = "$env:USERDOMAIN\$env:USERNAME"
-        # Remove the old broad grant if this machine was bootstrapped by an older version.
-        & icacls.exe $CiRoot '/remove:g' $auth '/T' '/C' 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ Success=$false; Message='icacls cleanup failed' } }
-        foreach ($d in @('queue','cancel','pairing')) {
-            & icacls.exe (Join-CiPath $CiRoot $d) '/grant' "${auth}:(OI)(CI)(M)" '/T' '/C' 2>&1 | Out-Null
+        # Root is traversable only; every child gets an explicit ACL so worktree is not leaked.
+        & icacls.exe $CiRoot '/inheritance:r' '/remove:g' $auth '/grant:r' "${buildUser}:(F)" 'SYSTEM:(F)' "${auth}:(RX)" '/C' 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ Success=$false; Message='icacls root cleanup failed' } }
+        $modify = @('queue','cancel','pairing')
+        $read = @('builds','results','logs','agents','processing')
+        foreach ($d in $modify) {
+            $path = Join-CiPath $CiRoot $d
+            & icacls.exe $path '/inheritance:r' '/grant:r' "${buildUser}:(OI)(CI)(F)" 'SYSTEM:(OI)(CI)(F)' "${auth}:(OI)(CI)(M)" '/T' '/C' 2>&1 | Out-Null
             if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ Success=$false; Message="ACL failed: $d" } }
         }
-        foreach ($d in @('builds','results','logs','agents')) {
-            & icacls.exe (Join-CiPath $CiRoot $d) '/grant' "${auth}:(OI)(CI)(RX)" '/T' '/C' 2>&1 | Out-Null
+        foreach ($d in $read) {
+            $path = Join-CiPath $CiRoot $d
+            & icacls.exe $path '/inheritance:r' '/grant:r' "${buildUser}:(OI)(CI)(F)" 'SYSTEM:(OI)(CI)(F)' "${auth}:(OI)(CI)(RX)" '/T' '/C' 2>&1 | Out-Null
             if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ Success=$false; Message="ACL failed: $d" } }
         }
-        & icacls.exe (Join-CiPath $CiRoot 'processing') '/grant' "${auth}:(OI)(CI)(RX)" '/T' '/C' 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ Success=$false; Message='ACL failed: processing client read' } }
-        foreach ($d in @('worktree','processing')) {
-            & icacls.exe (Join-CiPath $CiRoot $d) '/grant:r' "${buildUser}:(OI)(CI)(F)" 'SYSTEM:(OI)(CI)(F)' '/T' '/C' 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ Success=$false; Message="ACL failed: $d" } }
-        }
+        $worktree = Join-CiPath $CiRoot 'worktree'
+        & icacls.exe $worktree '/inheritance:r' '/remove:g' $auth '/grant:r' "${buildUser}:(OI)(CI)(F)" 'SYSTEM:(OI)(CI)(F)' '/T' '/C' 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ Success=$false; Message='ACL failed: worktree private' } }
         return [pscustomobject]@{ Success=$true; Message='CI root ACL ready (scoped)' }
     } catch { return [pscustomobject]@{ Success=$false; Message=$_.Exception.Message } }
+}
+
+function Test-CiClientRemoteAccess {
+    param([string]$CiRoot)
+    $checks = New-Object System.Collections.ArrayList
+    $add = { param($Name,$Ok,$Message) [void]$checks.Add([pscustomobject]@{Name=$Name;Ok=$Ok;Message=$Message}) }
+    $probe = {
+        param([string]$Path,[string]$Name)
+        $ok = $false; $file = Join-CiPath $Path ('.client-probe-' + [guid]::NewGuid().ToString('N'))
+        try { Set-Content -LiteralPath $file -Value 'probe' -Encoding UTF8 -ErrorAction Stop; $ok = $true }
+        catch {}
+        finally { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue }
+        & $add $Name $ok $Path
+    }
+    & $probe (Join-CiPath $CiRoot 'queue') 'Queue write'
+    & $probe (Join-CiPath $CiRoot 'cancel') 'Cancel write'
+    foreach ($d in @('agents','results','logs','builds')) {
+        $p = Join-CiPath $CiRoot $d
+        & $add "$d read" (Test-Path -LiteralPath $p -PathType Container) $p
+    }
+    $pairDir = Join-CiPath $CiRoot 'pairing'
+    & $add 'Pairing read' (Test-Path -LiteralPath $pairDir -PathType Container) $pairDir
+    $agents = @(Get-ChildItem -LiteralPath (Join-CiPath $CiRoot 'agents') -Filter '*.json' -ErrorAction SilentlyContinue)
+    & $add 'Agent heartbeat' ($agents.Count -gt 0) (if($agents.Count){$agents[0].FullName}else{'no heartbeat'})
+    $failed = @($checks | Where-Object { -not $_.Ok })
+    return [pscustomobject]@{ Success=($failed.Count -eq 0); Checks=$checks }
+}
+
+function Test-CiClientShareReachable {
+    param([string]$CiRoot)
+    try {
+        return (Test-Path -LiteralPath $CiRoot -PathType Container) -and
+               (Test-Path -LiteralPath (Join-CiPath $CiRoot 'queue') -PathType Container)
+    } catch { return $false }
+}
+
+function Test-CiGitRemoteAccess {
+    param([string]$Remote)
+    $result = [pscustomobject]@{ Success=$false; AuthRequired=$false; Message='' }
+    if (-not $Remote) { $result.Message = 'remote missing'; return $result }
+    $old = $ErrorActionPreference; $oldPrompt = $env:GIT_TERMINAL_PROMPT
+    $ErrorActionPreference = 'Continue'; $env:GIT_TERMINAL_PROMPT = '0'
+    try {
+        $out = @(& git ls-remote --quiet $Remote HEAD 2>&1 | ForEach-Object { "$_" }) -join "`n"
+        if ($LASTEXITCODE -eq 0) { $result.Success = $true; $result.Message = 'Git remote access OK'; return $result }
+        $result.AuthRequired = $out -match '(?i)authentication|auth|credential|permission denied|access denied|403|401|could not read username|repository not found'
+        $result.Message = if ($result.AuthRequired) { 'Private Git repository requires authentication on BUILD machine.' } else { ($out | Select-Object -First 1) }
+        return $result
+    } catch {
+        $result.AuthRequired = $true
+        $result.Message = 'Private Git repository requires authentication on BUILD machine.'
+        return $result
+    } finally { $ErrorActionPreference = $old; $env:GIT_TERMINAL_PROMPT = $oldPrompt }
 }
 
 function Ensure-CiSecureAcl {
@@ -146,6 +209,28 @@ function Test-CiAgentDoctor {
     & $add 'Git' ([bool]$git) $(if ($git) { $git.Source } else { 'missing' })
     $rootOk = (Test-Path $CiRoot) -and ((Get-Item $CiRoot -ErrorAction SilentlyContinue).PSIsContainer)
     & $add 'CI root' $rootOk $CiRoot
+    $diskOk = $false; $diskMessage = 'disk unavailable'
+    if ($CiRoot -match '^[A-Za-z]:\\') {
+        try {
+            $drive = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $CiRoot.Substring(0,2)) -ErrorAction Stop
+            $free = [math]::Round([double]$drive.FreeSpace / 1GB, 1); $diskOk = $free -ge 80; $diskMessage = "$free GB free (recommended >= 80 GB)"
+        } catch {}
+    }
+    & $add 'Disk' $diskOk $diskMessage
+    $profiles = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)
+    $trustedNetwork = ($profiles.Count -gt 0) -and (@($profiles | Where-Object { $_.NetworkCategory -eq 'Public' }).Count -eq 0)
+    & $add 'Network trust' $trustedNetwork $(if($trustedNetwork){'Private/Domain'}else{'Public or profile unavailable'})
+    $fwRule = Get-NetFirewallRule -DisplayName 'UnityCI SMB 445' -ErrorAction SilentlyContinue
+    $fwOk = $false
+    if ($fwRule) {
+        $port = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $fwRule -ErrorAction SilentlyContinue
+        $addr = Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $fwRule -ErrorAction SilentlyContinue
+        $profileText = "$($fwRule.Profile)"
+        $fwOk = ($fwRule.Enabled -eq 'True') -and ($profileText -match 'Domain') -and
+                ($profileText -match 'Private') -and ($port.Protocol -eq 'TCP') -and
+                ("$($port.LocalPort)" -eq '445') -and ("$($addr.RemoteAddress)" -match 'LocalSubnet')
+    }
+    & $add 'SMB firewall scope' $fwOk 'Private/Domain TCP 445 LocalSubnet'
     $write = $false
     try { $probe=Join-CiPath $CiRoot '.doctor-write'; Set-Content -LiteralPath $probe -Value 'ok' -ErrorAction Stop; Remove-Item -LiteralPath $probe -Force -ErrorAction Stop; $write=$true } catch {}
     & $add 'CI root writable' $write 'queue/results/worktree root'
@@ -169,6 +254,10 @@ function Test-CiAgentDoctor {
     if ($agentConfig) {
         foreach ($project in @($agentConfig.projects)) {
             if ($project.unityVersion) { & $add "Unity $($project.name)" $true (Format-UnityEditorResolution "$($project.unityVersion)") }
+            if ($project.gitRemote) {
+                $remoteCheck = Test-CiGitRemoteAccess "$($project.gitRemote)"
+                & $add "Git remote $($project.name)" $remoteCheck.Success $remoteCheck.Message
+            }
         }
     }
     if ($backendOk) {

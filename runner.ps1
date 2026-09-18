@@ -32,6 +32,59 @@ function Normalize-CiGitRemote {
     return ("$Remote".Trim() -replace '/+$','')
 }
 
+function Get-CiGitFailureCode {
+    param([string]$Message)
+    if ("$Message" -match '(?i)authentication|auth|credential|permission denied|access denied|403|401|could not read username|repository not found') { return 'GIT_AUTH_REQUIRED' }
+    return 'GIT_FAILURE'
+}
+
+function Get-CiBuildResourcePolicy {
+    param($Config)
+    $total = [Environment]::ProcessorCount
+    $mode = "$($Config.buildPerformanceMode)"
+    if ($mode -notin @('editor-friendly','balanced','max-speed')) {
+        $mode = if ("$($Config.role)" -eq 'agent') { 'max-speed' } else { 'balanced' }
+    }
+    $reserve = switch ($mode) {
+        'editor-friendly' { [Math]::Max(1, [int][Math]::Ceiling($total * 0.25)) }
+        'balanced' { if ($total -le 4) { 1 } else { 2 } }
+        default { 0 }
+    }
+    if ($Config.reserveCoresForEditor -ne $null -and [int]$Config.reserveCoresForEditor -gt 0 -and $mode -eq 'editor-friendly') {
+        $reserve = [int]$Config.reserveCoresForEditor
+    }
+    if ($reserve -ge $total) { $reserve = [Math]::Max(0, $total - 1) }
+    [pscustomobject]@{ Mode=$mode; PriorityClass=$(if($mode -eq 'editor-friendly'){'BelowNormal'}else{'Normal'}); ReserveCores=$reserve; ProcessorAffinity=$null; AffinityApplied=$false }
+}
+
+function Apply-CiBuildResourcePolicy {
+    param($Process, $Config)
+    $policy = Get-CiBuildResourcePolicy $Config
+    try {
+        if ($policy.PriorityClass -eq 'BelowNormal') {
+            $Process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
+        } else {
+            $Process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Normal
+        }
+    } catch {}
+    if ([Environment]::ProcessorCount -gt 63) {
+        Write-RunnerLog $Config "RESOURCE POLICY [$($policy.Mode)] priority=$($policy.PriorityClass) reserve=$($policy.ReserveCores); affinity skipped for >63 logical processors"
+        return $policy
+    }
+    try {
+        $usable = [Environment]::ProcessorCount - $policy.ReserveCores
+        if ($policy.ReserveCores -gt 0 -and $usable -gt 0) {
+            [long]$mask = 0
+            for ($i = 0; $i -lt $usable; $i++) { $mask = $mask -bor ([long]1 -shl $i) }
+            $Process.ProcessorAffinity = [IntPtr]$mask
+            $policy.ProcessorAffinity = $mask
+            $policy.AffinityApplied = $true
+        }
+    } catch {}
+    Write-RunnerLog $Config "RESOURCE POLICY [$($policy.Mode)] priority=$($policy.PriorityClass) reserve=$($policy.ReserveCores) affinity=$($policy.AffinityApplied)"
+    return $policy
+}
+
 function Test-CiGitRemoteAllowed {
     param($Root, [string]$ProjectName, [string]$Remote)
     $value = Normalize-CiGitRemote $Remote
@@ -106,13 +159,17 @@ function Sync-Worktree {
         }
         if (-not (Test-CiWorktreeUsable $wt)) {
             if ($cloneOutput) { Write-RunnerLog $Config "CLONE ERROR [$($Config.projectName)]: $cloneOutput" }
-            throw "Clone that bai tu: $remote`n$cloneOutput"
+            throw "$(Get-CiGitFailureCode $cloneOutput) | Clone that bai tu: $remote`n$cloneOutput"
         }
     }
 
     # Clone/worktree co san van co the chua co commit moi nhat
     $r = Invoke-Git $wt @('fetch','--all','--prune','--quiet')
-    if ($r.ExitCode -ne 0) { Write-RunnerLog $Config "canh bao: git fetch exit $($r.ExitCode)" }
+    if ($r.ExitCode -ne 0) {
+        $code = Get-CiGitFailureCode $r.Output
+        if ($code -eq 'GIT_AUTH_REQUIRED') { throw "$code | Git fetch failed for BUILD Windows user" }
+        Write-RunnerLog $Config "canh bao: git fetch exit $($r.ExitCode)"
+    }
 
     # --force + reset --hard: bat buoc, vi build truoc do da sua ProjectSettings.asset
     # (bundleVersionCode, keystore...) -> checkout thuong se bi tu choi.
@@ -241,7 +298,7 @@ function Sync-CiUnityCache {
     $hit = $libraryExists -and $previous -and ($previous -eq $current)
     if ($hit) {
         Write-RunnerLog $Config "CACHE HIT  [$($Config.projectName)] fp=$($current.Substring(0,12)) - giu nguyen Library/Temp/obj"
-        return
+        return [pscustomobject]@{ State='hit'; Reason='fingerprint matched'; Fingerprint=$current; Path=$fpPath; NeedsSave=$false }
     }
 
     $initialize = -not $previous
@@ -249,8 +306,10 @@ function Sync-CiUnityCache {
         $reason = if ($libraryExists) { 'chua co fingerprint' } else { 'Library not present' }
         Write-RunnerLog $Config "CACHE INITIALIZE [$($Config.projectName)] ($reason)"
     } elseif ($previous -ne $current) {
+        $reason = 'fingerprint changed'
         Write-RunnerLog $Config "CACHE MISS [$($Config.projectName)] reason=fingerprint changed - xoa Library/Temp/obj"
     } else {
+        $reason = 'Library missing'
         Write-RunnerLog $Config "CACHE MISS [$($Config.projectName)] reason=Library missing - xoa Library/Temp/obj"
     }
     foreach ($dir in @($library, $temp, $obj)) {
@@ -259,12 +318,12 @@ function Sync-CiUnityCache {
         }
     }
 
-    return [pscustomobject]@{ Fingerprint = $current; Path = $fpPath }
+    return [pscustomobject]@{ State=$(if($initialize){'initialize'}else{'miss'}); Reason=$reason; Fingerprint=$current; Path=$fpPath; NeedsSave=$true }
 }
 
 function Save-CiUnityCacheFingerprint {
     param($CacheState, $Config)
-    if (-not $CacheState -or -not $CacheState.Fingerprint -or -not $CacheState.Path) { return }
+    if (-not $CacheState -or -not $CacheState.NeedsSave -or -not $CacheState.Fingerprint -or -not $CacheState.Path) { return }
     Set-Content -LiteralPath $CacheState.Path -Value $CacheState.Fingerprint -Encoding ASCII
     Write-RunnerLog $Config "CACHE FINGERPRINT SAVED [$($Config.projectName)] fp=$($CacheState.Fingerprint.Substring(0,12))"
 }
@@ -330,17 +389,7 @@ function Invoke-UnityBuild {
 
     $proc = [System.Diagnostics.Process]::Start($psi)
 
-    # Nhuong CPU cho Editor: uu tien thap + chua lai vai core
-    try { $proc.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch {}
-    try {
-        $total   = [Environment]::ProcessorCount
-        $reserve = [int]$Config.reserveCoresForEditor
-        if ($reserve -gt 0 -and $total -gt $reserve -and $total -le 63) {
-            $mask = 0
-            for ($i = 0; $i -lt ($total - $reserve); $i++) { $mask = $mask -bor (1 -shl $i) }
-            $proc.ProcessorAffinity = [IntPtr]$mask
-        }
-    } catch {}
+    $resourcePolicy = Apply-CiBuildResourcePolicy -Process $proc -Config $Config
 
     # Vong cho co nhip: vua canh timeout, vua doc giai doan tu log,
     # vua sua lai tin nhan Discord. Khong dung WaitForExit chan cung
@@ -356,14 +405,16 @@ function Invoke-UnityBuild {
         if ((Get-Date) -gt $timeoutAt) {
             try { $proc.Kill() } catch {}
             try { $proc.WaitForExit(15000) | Out-Null } catch {}
-            return [pscustomobject]@{ Started = $true; ExitCode = -1; TimedOut = $true; Cancelled = $false; Phase = $tracker.Name }
+            Complete-CiPhaseTracker $tracker
+            return [pscustomobject]@{ Started = $true; ExitCode = -1; TimedOut = $true; Cancelled = $false; Phase = $tracker.Name; PhaseTimings=$tracker.Durations; ResourcePolicy=$resourcePolicy }
         }
 
         # Nguoi dung bam huy -> giet Unity ngay, khong doi het timeout
         if (Test-CiCancelRequested $Config $Job.id) {
             try { $proc.Kill() } catch {}
             try { $proc.WaitForExit(15000) | Out-Null } catch {}
-            return [pscustomobject]@{ Started = $true; ExitCode = -2; TimedOut = $false; Cancelled = $true; Phase = $tracker.Name }
+            Complete-CiPhaseTracker $tracker
+            return [pscustomobject]@{ Started = $true; ExitCode = -2; TimedOut = $false; Cancelled = $true; Phase = $tracker.Name; PhaseTimings=$tracker.Durations; ResourcePolicy=$resourcePolicy }
         }
 
         $tracker = Update-CiPhaseTracker $tracker $LogPath
@@ -377,7 +428,9 @@ function Invoke-UnityBuild {
         }
     }
     $proc.WaitForExit()
-    return [pscustomobject]@{ Started = $true; ExitCode = $proc.ExitCode; TimedOut = $false; Cancelled = $false; Phase = $tracker.Name }
+    $tracker = Update-CiPhaseTracker $tracker $LogPath
+    Complete-CiPhaseTracker $tracker
+    return [pscustomobject]@{ Started = $true; ExitCode = $proc.ExitCode; TimedOut = $false; Cancelled = $false; Phase = $tracker.Name; PhaseTimings=$tracker.Durations; ResourcePolicy=$resourcePolicy }
 }
 
 # ------------------------------------------------------------
@@ -395,10 +448,13 @@ function Invoke-CiJob {
 
     # Uoc tinh tu cac lan build thanh cong truoc do cua dung loai nay
     $eta = Get-CiEtaSeconds -Config $Config -ProjectName $Config.projectName `
-                            -Format "$($Job.format)" -BuildConfig "$($Job.config)"
+                            -Format "$($Job.format)" -BuildConfig "$($Job.config)" -DevelopmentBuild ([bool]$Job.developmentBuild)
     $msgId = $MessageId
 
     $success = $false; $cancelled = $false; $failReason = ''; $sizeBytes = 0; $link = ''; $errInfo = $null
+    $timings = [ordered]@{}
+    $cacheState = $null
+    $previousSize = $null
     $publishError = ''
 
     try {
@@ -407,9 +463,13 @@ function Invoke-CiJob {
             $cancelled = $true
             throw 'Da huy truoc khi build bat dau'
         }
+        $stageStarted = Get-Date
         if (-not $WorktreeSynced) { Sync-Worktree -Config $Config -Sha $Job.sha -GitRemote "$($Job.gitRemote)" }
+        $timings.gitSyncSeconds = [math]::Round(((Get-Date) - $stageStarted).TotalSeconds, 1)
         Update-CiDiscordPhase -Webhook $Webhook -MessageId $msgId -Job $Job -Phase 'Kiem tra Library cache' -StartedAt $started
+        $stageStarted = Get-Date
         $cacheState = Sync-CiUnityCache -Config $Config
+        $timings.cacheSeconds = [math]::Round(((Get-Date) - $stageStarted).TotalSeconds, 1)
         Copy-CiScript  -Config $Config
 
         # versionCode = so commit tinh den sha nay. Deterministic, khong can file state.
@@ -422,12 +482,17 @@ function Invoke-CiJob {
         # Kem ten branch vao ten file: hai branch co the co cung so commit
         # -> cung versionCode, nhin ten file khong the phan biet duoc
         $brSafe = ConvertTo-CiSafeName "$($Job.branch)"
-        $Job.outputPath = Join-CiPath $paths.Builds ("{0}-{1}-{2}-{3}.{4}" -f $Job.id, $brSafe, $Job.shaShort, $Job.config, $ext)
+        $profileSuffix = "$($Job.config)"
+        if ([bool]$Job.developmentBuild) { $profileSuffix += '-development' }
+        $Job.outputPath = Join-CiPath $paths.Builds ("{0}-{1}-{2}-{3}.{4}" -f $Job.id, $brSafe, $Job.shaShort, $profileSuffix, $ext)
         $Job | Add-Member -NotePropertyName resultPath -NotePropertyValue (Join-CiPath $paths.Logs ("{0}.unity-result.json" -f $Job.id)) -Force
         Write-JsonFile $jobFile $Job
 
+        $stageStarted = Get-Date
         $run = Invoke-UnityBuild -Config $Config -Job $Job -JobFile $jobFile -LogPath $logPath -Secrets $Secrets `
                                  -Webhook $Webhook -MessageId $msgId -EtaSeconds $eta -StartedAt $started
+        $timings.unitySeconds = [math]::Round(((Get-Date) - $stageStarted).TotalSeconds, 1)
+        if ($run.PhaseTimings) { $timings.phases = $run.PhaseTimings }
 
         # Cache validity depends on Unity completing its process, not on APK success.
         # Compile/package failures still leave a fully imported Library usable next run.
@@ -447,6 +512,8 @@ function Invoke-CiJob {
         } else {
             $success   = $true
             $sizeBytes = (Get-Item $Job.outputPath).Length
+            $previousSize = Get-CiPreviousSameProfileSize -Config $Config -ProjectName $Config.projectName `
+                -Format $Job.format -BuildConfig $Job.config -DevelopmentBuild ([bool]$Job.developmentBuild)
         }
     } catch {
         $failReason = $_.Exception.Message
@@ -473,6 +540,10 @@ function Invoke-CiJob {
         $errInfo = Write-CiErrorReport -LogPath $logPath -OutPath $errPath -Job $Job -Reason $failReason
     }
 
+    $sizeDeltaPercent = $null
+    if ($previousSize -and [long]$previousSize.sizeBytes -gt 0) {
+        $sizeDeltaPercent = [math]::Round((($sizeBytes - [double]$previousSize.sizeBytes) / [double]$previousSize.sizeBytes) * 100, 1)
+    }
     $result = [pscustomobject]@{
         id          = $Job.id
         project     = $Config.projectName
@@ -484,10 +555,17 @@ function Invoke-CiJob {
         subject     = $Job.subject
         format      = $Job.format
         config      = $Job.config
+        developmentBuild = [bool]$Job.developmentBuild
+        profile     = ("{0}/{1}/{2}" -f $Job.format.ToUpper(), $Job.config, $(if($Job.developmentBuild){'development'}else{'quick'}))
         by          = $Job.by
         versionCode = $Job.versionCode
         outputPath  = $(if ($success) { $Job.outputPath } else { '' })
         sizeBytes   = $sizeBytes
+        previousSizeBytes = $(if($previousSize){[long]$previousSize.sizeBytes}else{$null})
+        sizeDeltaPercent = $sizeDeltaPercent
+        cacheState  = $(if($cacheState){$cacheState.State}else{''})
+        cacheReason = $(if($cacheState){$cacheState.Reason}else{''})
+        timings     = [pscustomobject]$timings
         driveLink   = $link
         publishError= $publishError
         durationSec = [math]::Round($duration, 1)
@@ -554,13 +632,17 @@ function Register-CiProjectFromJob {
         $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
         $cloneOutput = ''
         try { $cloneOutput = ((& git clone --quiet $remote $wt 2>&1) | ForEach-Object { "$_" }) -join "`n" } finally { $ErrorActionPreference = $old }
-        if (-not (Test-CiWorktreeUsable $wt)) { throw "GIT_FAILURE | Clone that bai tu: $remote`n$cloneOutput" }
+        if (-not (Test-CiWorktreeUsable $wt)) { throw "$(Get-CiGitFailureCode $cloneOutput) | Clone that bai tu: $remote`n$cloneOutput" }
     }
 
     Update-CiDiscordPhase -Webhook $Webhook -MessageId $MessageId -Job $Job -Phase 'Dong bo Git' -StartedAt $StartedAt
     $syncConfig = [pscustomobject]@{ ciRoot=$Root.ciRoot; projectName=$name; projectPath=''; worktreePath=$wt; gitRemote=$remote }
     try { Sync-Worktree -Config $syncConfig -Sha "$($Job.sha)" -GitRemote $remote }
-    catch { throw "GIT_FAILURE | $($_.Exception.Message)" }
+    catch {
+        $message = "$($_.Exception.Message)"
+        if ($message -match '^GIT_(AUTH_REQUIRED|FAILURE)\s*\|') { throw $message }
+        throw "$(Get-CiGitFailureCode $message) | $message"
+    }
 
     try { $ver = Get-CiUnityVersionAtCommit -WorktreePath $wt -Sha "$($Job.sha)" }
     catch { throw "PREFLIGHT_FAILURE | $($_.Exception.Message)" }
@@ -620,12 +702,12 @@ function Assert-CiJobCredentials {
 function Write-CiPreflightFailureResult {
     param($Root, $Job, [string]$Message, [datetime]$StartedAt, [bool]$Cancelled = $false)
     $stage = 'preflight'
-    if ($Message -match '^REMOTE_NOT_TRUSTED|^GIT_FAILURE') { $stage = 'git' }
+    if ($Message -match '^REMOTE_NOT_TRUSTED|^GIT_FAILURE|^GIT_AUTH_REQUIRED') { $stage = 'git' }
     elseif ($Message -match '^PROVISIONING_FAILED') { $stage = 'provisioning' }
     elseif ($Message -match '^CREDENTIALS_REQUIRED') { $stage = 'credentials' }
     Write-JsonFile (Join-CiPath $Root.ciRoot 'results' ("{0}.json" -f $Job.id)) ([pscustomobject]@{
         id=$Job.id; project=$Job.project; success=$false; cancelled=$Cancelled; branch=$Job.branch
-        sha=$Job.sha; shaShort=$Job.shaShort; format=$Job.format; config=$Job.config
+        sha=$Job.sha; shaShort=$Job.shaShort; format=$Job.format; config=$Job.config; developmentBuild=[bool]$Job.developmentBuild
         failureStage=$stage; failReason=$Message; durationSec=[math]::Round(((Get-Date) - $StartedAt).TotalSeconds, 1); finishedAt=(Get-Date).ToString('o')
     })
 }
@@ -644,7 +726,11 @@ function Resolve-CiJobConfig {
         $cfg = Get-EffectiveConfig $Root "$($Job.project)"
         Update-CiDiscordPhase -Webhook $Webhook -MessageId $MessageId -Job $Job -Phase 'Dong bo Git' -StartedAt $StartedAt
         try { Sync-Worktree -Config $cfg -Sha "$($Job.sha)" -GitRemote "$($Job.gitRemote)" }
-        catch { throw "GIT_FAILURE | $($_.Exception.Message)" }
+        catch {
+            $message = "$($_.Exception.Message)"
+            if ($message -match '^GIT_(AUTH_REQUIRED|FAILURE)\s*\|') { throw $message }
+            throw "$(Get-CiGitFailureCode $message) | $message"
+        }
         try { $ver = Get-CiUnityVersionAtCommit -WorktreePath $cfg.worktreePath -Sha "$($Job.sha)" }
         catch { throw "PREFLIGHT_FAILURE | $($_.Exception.Message)" }
         Write-RunnerLog $Root (Format-UnityEditorResolution $ver)

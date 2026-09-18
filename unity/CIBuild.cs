@@ -27,6 +27,7 @@ namespace VTL.CI
         public string subject;
         public string format;      // apk | aab
         public string config;      // dev | release
+        public bool   developmentBuild;
         public string by;
         public int    versionCode;
         public string versionName;
@@ -47,6 +48,9 @@ namespace VTL.CI
         public int    totalErrors;
         public int    totalWarnings;
         public string message;
+        public string format;
+        public string config;
+        public bool   developmentBuild;
     }
 
     public static class CIBuild
@@ -86,7 +90,7 @@ namespace VTL.CI
                     locationPathName = job.outputPath,
                     target           = BuildTarget.Android,
                     targetGroup      = BuildTargetGroup.Android,
-                    options          = job.config == "dev"
+                    options          = job.developmentBuild
                                        ? BuildOptions.Development
                                        : BuildOptions.None
                 };
@@ -106,6 +110,9 @@ namespace VTL.CI
                     durationSeconds = (DateTime.UtcNow - started).TotalSeconds,
                     totalErrors     = (int)summary.totalErrors,
                     totalWarnings   = (int)summary.totalWarnings,
+                    format          = job.format,
+                    config          = job.config,
+                    developmentBuild= job.developmentBuild,
                     message         = ok ? "" : ("BuildResult=" + summary.result)
                 });
 
@@ -123,6 +130,9 @@ namespace VTL.CI
                         success         = false,
                         result          = "Exception",
                         durationSeconds = (DateTime.UtcNow - started).TotalSeconds,
+                        format          = job != null ? job.format : "",
+                        config          = job != null ? job.config : "",
+                        developmentBuild = job != null && job.developmentBuild,
                         message         = e.Message
                     });
                 }
@@ -165,7 +175,7 @@ namespace VTL.CI
         static void ApplySettings(CiJob job)
         {
             EditorUserBuildSettings.buildAppBundle = (job.format == "aab");
-            EditorUserBuildSettings.development    = (job.config == "dev");
+            EditorUserBuildSettings.development    = job.developmentBuild;
 
             if (job.versionCode > 0) PlayerSettings.Android.bundleVersionCode = job.versionCode;
             if (!string.IsNullOrEmpty(job.versionName)) PlayerSettings.bundleVersion = job.versionName;

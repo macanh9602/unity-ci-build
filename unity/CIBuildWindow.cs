@@ -60,6 +60,7 @@ namespace VTL.CI
         public string shaShort;
         public string format;
         public string config;
+        public bool developmentBuild;
     }
 
     [Serializable] class CiResultView
@@ -77,6 +78,10 @@ namespace VTL.CI
         public string errorsPath;
         public string failReason;
         public double durationSec;
+        public long sizeBytes;
+        public string profile;
+        public string cacheState;
+        public bool developmentBuild;
     }
 
     public class CIBuildWindow : EditorWindow
@@ -87,6 +92,7 @@ namespace VTL.CI
         CiConfig        _cfg;
         CiProjectEntry  _proj;
         DropdownField _formatField, _configField, _branchField;
+        Toggle _developmentField;
         VisualElement _cancelRow;
         Label        _headLabel, _stateLabel;
         HelpBox      _dirtyBox, _errorBox;
@@ -160,6 +166,9 @@ namespace VTL.CI
             _configField = new DropdownField("Ban",       new List<string> { "dev", "release" }, 0);
             root.Add(_formatField);
             root.Add(_configField);
+            _developmentField = new Toggle("Development Build") { value = false };
+            _developmentField.tooltip = "Opt-in Unity Development Build; khong dong nghia voi Dev signing.";
+            root.Add(_developmentField);
 
             RefreshBranches();
 
@@ -221,6 +230,7 @@ namespace VTL.CI
                 var job = Enqueue(_toolDir, _cfg, _proj, git,
                                   _formatField.value.ToLower(),
                                   _configField.value,
+                                  _developmentField != null && _developmentField.value,
                                   "unity-editor", target);
 
                 // Chi tu khoi dong runner khi build tai chinh may nay
@@ -392,8 +402,12 @@ namespace VTL.CI
                 };
                 row.Add(dot);
 
-                var text = r.branch + "@" + r.shaShort + "  " + (r.format ?? "").ToUpper() + "/" + r.config +
-                           "  " + Mathf.RoundToInt((float)r.durationSec) + "s";
+                var profile = string.IsNullOrEmpty(r.profile)
+                    ? (r.format ?? "").ToUpper() + "/" + r.config + "/quick" : r.profile;
+                var text = r.branch + "@" + r.shaShort + "  " + profile +
+                           "  " + Mathf.RoundToInt((float)r.durationSec) + "s" +
+                           (r.sizeBytes > 0 ? "  " + (r.sizeBytes / (1024f * 1024f)).ToString("0.0") + " MB" : "") +
+                           (!string.IsNullOrEmpty(r.cacheState) ? "  cache:" + r.cacheState : "");
                 row.Add(new Label(text) { style = { flexGrow = 1 } });
 
                 if (r.success && !string.IsNullOrEmpty(r.outputPath))
@@ -609,14 +623,14 @@ namespace VTL.CI
             var target = AskWhereToBuild(cfg);
             if (target == null) return;
 
-            var id = Enqueue(toolDir, cfg, proj, git, format, config, "unity-menu", target);
+            var id = Enqueue(toolDir, cfg, proj, git, format, config, false, "unity-menu", target);
             if (!string.IsNullOrEmpty(target)) StartRunner(toolDir);
 
             Debug.Log("[CI] Da xep hang " + id + " [" + proj.name + "]" +
                       (string.IsNullOrEmpty(target) ? " - da gui sang may build." : " - dang build nen tai may nay."));
         }
 
-        static string Enqueue(string toolDir, CiConfig cfg, CiProjectEntry proj, GitInfo git, string format, string config, string by, string targetAgent)
+        static string Enqueue(string toolDir, CiConfig cfg, CiProjectEntry proj, GitInfo git, string format, string config, bool developmentBuild, string by, string targetAgent)
         {
             var id = DateTime.Now.ToString("yyyyMMdd-HHmmss") + "-" + Guid.NewGuid().ToString("N").Substring(0, 4);
             var job = new CiJob
@@ -633,6 +647,7 @@ namespace VTL.CI
                 subject     = git.Subject,
                 format      = format,
                 config      = config,
+                developmentBuild = developmentBuild,
                 by          = by,
                 versionCode = git.Count,
                 versionName = "",

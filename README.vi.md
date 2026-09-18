@@ -18,6 +18,29 @@ Gửi yêu cầu build và build một Git commit cụ thể trong workspace đ�
 Project dev → queue → build workspace → Unity batchmode → APK/AAB
 ```
 
+## Ba mode va ownership
+
+```text
+                HTTPS / SSH
+DEV  ------------------------------> Git Remote
+                                       |
+                                       | clone/fetch SHA
+                                       v
+                                   BUILD MACHINE
+                                       ^
+                                       |
+               SMB TCP 445           |
+DEV  ---------------------------------+
+      queue / cancel / status
+      logs / results / artifact
+```
+
+Default: DEV va BUILD cung trusted LAN.
+VPN la advanced/manual: user phai tu cau hinh VPN route va firewall subnet.
+Khong expose SMB TCP 445 truc tiep ra public Internet.
+Git la source-code transport; khong copy project qua SMB. Keystore, password,
+Discord secret va `UnityCISecure` chi nam local tren BUILD.
+
 ## Giải pháp
 
 - Build từ Unity, batch file hoặc PowerShell.
@@ -34,15 +57,17 @@ Project dev → queue → build workspace → Unity batchmode → APK/AAB
 .\build.bat
 ```
 
-Nếu dùng máy riêng, chạy `install-agent.bat` trên build machine rồi pair máy dev:
+Neu dung may rieng, chon `BUILD AGENT` trong `install.bat` tren build machine,
+sau do chon `DEV CLIENT` trong `install.bat` tren may dev. Pairing da nam trong
+client setup, khong can chay them `ci.ps1 pair`.
 
-```powershell
-.\ci.ps1 pair BUILD-PC-01
-```
 
 ## Cài đặt
 
-Installer kiểm tra PowerShell, Git, Unity Hub, Editor cần dùng, Android Build Support, Android SDK/NDK, OpenJDK và dung lượng disk.
+Standalone kiem tra PowerShell, Git, Unity Hub, Editor, Android Build Support,
+Android SDK/NDK, OpenJDK va dung luong disk. DEV CLIENT chi kiem tra Git project
+local va `ProjectVersion.txt`; Android module va Unity executable local khong phai
+build requirement.
 
 Agent bootstrap chuẩn bị CI root, SMB share, firewall, Scheduled Task, heartbeat, Unity CLI và Android module. Đăng nhập trước lần provisioning đầu tiên:
 
@@ -79,6 +104,13 @@ Client ghi job vào `queue/` bằng temporary file rồi atomic rename. Runner n
 
 Build remote dùng SMB cho queue, cancel, result, log và quyền đọc artifact. Remote agent chỉ thấy commit đã push.
 
+Client khong duoc build local. Neu agent offline, job van nam trong queue;
+`ci.ps1 build -Local` se fail ro rang cho den khi doi may sang `standalone`.
+
+Tren build machine, SMB chi mo tren profile Private/Domain va TCP 445 tu
+`LocalSubnet`. Profile Public se block agent setup. NTFS ACL giu rieng
+`worktree/` va `UnityCISecure`, chi expose cac path queue/status/log/artifact can thiet.
+
 ## Git Commit và Branch
 
 Mỗi job lưu branch và commit SHA. Client đọc branch được chọn mà không checkout nên thay đổi local không bị đụng tới. Hãy push commit trước remote build; tên artifact có branch và short commit.
@@ -86,6 +118,13 @@ Mỗi job lưu branch và commit SHA. Client đọc branch được chọn mà k
 Build agent xem metadata trong queue là input không đáng tin. Remote phải có dạng HTTPS/SSH hợp lệ và remote đã cấu hình của project không được thay bằng giá trị khác từ queue. Chỉ trỏ agent tới repository mà team tin cậy.
 
 ## Worktree và Library Cache
+
+### Private Git repository
+
+BUILD authenticate Git bằng chính Windows user chạy `UnityCIBuildAgent` (ưu tiên
+Git Credential Manager cho HTTPS hoặc SSH key đã cấu hình). Credential không được
+đưa vào `config.json`, queue hoặc SMB share. Agent doctor dùng `git ls-remote` và
+báo `GIT_AUTH_REQUIRED` nếu BUILD chưa được authenticate.
 
 Runner tính fingerprint từ Unity Editor version thực tế, `ProjectSettings/ProjectVersion.txt`, `Packages/manifest.json` và `Packages/packages-lock.json`.
 
@@ -126,6 +165,21 @@ Release build cần keystore, alias và password. Credential được kiểm tra
 Secrets dùng Windows DPAPI. Keystore nằm ngoài SMB share trong `UnityCISecure`; password không bao giờ vào queue job.
 
 ## Các Rule quan trọng
+
+### Build profile, performance và measurement
+
+`config=dev` chỉ quyết định signing/profile, không tự bật Unity `Development Build`.
+Flow quick/test mặc định là `dev` với `developmentBuild=false`; dùng `-Development` nếu
+cần opt-in Unity Development Build. Release luôn non-development. Tên artifact chứa profile,
+ví dụ `job-branch-sha-dev.apk` hoặc `job-branch-sha-dev-development.apk`.
+
+Config có `buildPerformanceMode`: `editor-friendly`, `balanced` hoặc `max-speed`. Config cũ
+được migrate an toàn; standalone mặc định `balanced`, agent mặc định `max-speed`. Runner ghi
+policy và timing theo phase (Git sync, cache, Unity); cache là `hit`, `miss` hoặc `initialize`
+kèm reason. So sánh size chỉ mang tính thông tin và chỉ so với cùng project, format, signing
+config và trạng thái Development Build.
+
+Đây là trusted LAN/VPN transport, không phải Internet-facing service.
 
 1. Build từ một commit cụ thể.
 2. Không đổi checkout của dev để build branch khác.
@@ -178,7 +232,6 @@ Push branch và commit lên Git remote đã cấu hình.
 ```text
 Build_CICD/
 ├── install.bat
-├── install-agent.bat
 ├── setup.ps1
 ├── setup-agent.ps1
 ├── ci.ps1
@@ -206,6 +259,17 @@ Một CI root và queue có thể phục vụ nhiều project. Mỗi project có
 Feature stable gồm Android APK/AAB, local workspace, Git worktree, branch build, cancel, Discord result, artifact publishing, heartbeat, cache fingerprint và worktree recovery.
 
 ## Experimental
+
+## Network transport support matrix
+
+```text
+Same LAN       = SUPPORTED mac dinh
+Trusted VPN    = ADVANCED; tu cau hinh route va firewall subnet
+Public Internet SMB = NOT SUPPORTED
+```
+
+Installer khong tu detect/whitelist VPN adapter. TCP 445 van gioi han o
+`LocalSubnet`, profile Public bi block, va khong bao gio dung `RemoteAddress=Any`.
 
 Build-agent bootstrap, pairing dev với agent, tự động provision Unity CLI, Android module provisioning và agent doctor mở rộng nên được kiểm tra trên máy phụ trước release.
 

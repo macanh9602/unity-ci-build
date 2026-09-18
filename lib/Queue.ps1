@@ -22,7 +22,8 @@ function Add-CiJob {
         [string]$Platform = 'android',
         [string]$GitRemote = '',
         [string]$UnityVersion = '',
-        [string]$TargetAgent = ''
+        [string]$TargetAgent = '',
+        [switch]$DevelopmentBuild
     )
     $paths = Get-CiPaths $Config
     if (-not (Test-Path $paths.Queue)) { New-Item -ItemType Directory -Force -Path $paths.Queue | Out-Null }
@@ -41,6 +42,7 @@ function Add-CiJob {
         subject     = $Subject
         format      = $Format
         config      = $BuildConfig
+        developmentBuild = [bool]$DevelopmentBuild
         by          = $By
         versionCode = $VersionCode
         versionName = ''
